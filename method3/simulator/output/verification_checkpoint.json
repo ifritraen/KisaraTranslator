@@ -1,0 +1,37 @@
+{
+  "completed": 16,
+  "total": 16,
+  "latest_record": {
+    "page_id": "batch4_c13_p091.jpg",
+    "batch": "batch4",
+    "image_dims": [
+      1128,
+      1600
+    ],
+    "global_char_w": 28.0,
+    "m1_box_count": 109,
+    "bubble_count": 11,
+    "m1_5_bubbled": 67,
+    "m1_5_orphan": 23,
+    "m1_5_sfx": 19,
+    "m2_lines_total": 45,
+    "m2_bubbled_lines": 14,
+    "m2_orphan_lines": 3,
+    "m2_sfx_lines": 28,
+    "m3_conjoined_bubbles": 0,
+    "m3_split_lines": 0,
+    "column_fragmentations": 0,
+    "column_pitch_violations": 0,
+    "width_choking_count": 0,
+    "boundary_bleed_count": 0,
+    "boundary_bleed_area": 0,
+    "gutter_crossover_count": 0,
+    "furigana_leaks": 2,
+    "dropped_box_count": 0,
+    "waist_snap_failures": 0,
+    "total_violations": 0,
+    "elapsed_ms": 13338.6,
+    "furigana_suppressed_m2": 2,
+    "filename": "c13_p091.jpg"
+  }
+}
