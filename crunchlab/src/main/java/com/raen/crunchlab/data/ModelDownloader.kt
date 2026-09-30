@@ -332,11 +332,12 @@ class ModelDownloader(private val context: Context) {
         try {
             val extRoot = Environment.getExternalStorageDirectory()
             val candidatePaths = listOf(
+                File(extRoot, "Download/$MODEL_SUGOI_ENCODER"),
                 File(context.getExternalFilesDir(null), "models/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_ENCODER"),
                 File(extRoot, "Download/sugoi/$MODEL_SUGOI_ENCODER"),
                 File(extRoot, "Download/sugoi_onnx/$MODEL_SUGOI_ENCODER"),
                 File(extRoot, "Download/KisaraTranslator/sugoi/$MODEL_SUGOI_ENCODER"),
-                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_ENCODER"),
                 File(extRoot, "Android/data/com.raen.kisaratranslator/files/models/sugoi/$MODEL_SUGOI_ENCODER"),
                 File(extRoot, "Android/data/com.raen.kisaratranslator.debug/files/models/sugoi/$MODEL_SUGOI_ENCODER"),
                 File(extRoot, "Android/data/com.raen.kisara/files/models/sugoi/$MODEL_SUGOI_ENCODER"),
@@ -344,6 +345,7 @@ class ModelDownloader(private val context: Context) {
                 File(extRoot, MODEL_SUGOI_ENCODER),
                 // Quantized or FP32 fallback
                 File(context.getExternalFilesDir(null), "models/sugoi/encoder_model.onnx"),
+                File(extRoot, "Download/encoder_model.onnx"),
                 File(extRoot, "Download/sugoi/encoder_model.onnx"),
                 File(extRoot, "Download/sugoi_onnx/encoder_model.onnx"),
                 File(extRoot, "Download/KisaraTranslator/sugoi_deploy/encoder_model.onnx"),
@@ -368,11 +370,12 @@ class ModelDownloader(private val context: Context) {
         try {
             val extRoot = Environment.getExternalStorageDirectory()
             val candidatePaths = listOf(
+                File(extRoot, "Download/$MODEL_SUGOI_DECODER"),
                 File(context.getExternalFilesDir(null), "models/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_DECODER"),
                 File(extRoot, "Download/sugoi/$MODEL_SUGOI_DECODER"),
                 File(extRoot, "Download/sugoi_onnx/$MODEL_SUGOI_DECODER"),
                 File(extRoot, "Download/KisaraTranslator/sugoi/$MODEL_SUGOI_DECODER"),
-                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_DECODER"),
                 File(extRoot, "Android/data/com.raen.kisaratranslator/files/models/sugoi/$MODEL_SUGOI_DECODER"),
                 File(extRoot, "Android/data/com.raen.kisaratranslator.debug/files/models/sugoi/$MODEL_SUGOI_DECODER"),
                 File(extRoot, "Android/data/com.raen.kisara/files/models/sugoi/$MODEL_SUGOI_DECODER"),
@@ -380,6 +383,7 @@ class ModelDownloader(private val context: Context) {
                 File(extRoot, MODEL_SUGOI_DECODER),
                 // Quantized or FP32 fallback
                 File(context.getExternalFilesDir(null), "models/sugoi/decoder_model.onnx"),
+                File(extRoot, "Download/decoder_model.onnx"),
                 File(extRoot, "Download/sugoi/decoder_model.onnx"),
                 File(extRoot, "Download/sugoi_onnx/decoder_model.onnx"),
                 File(extRoot, "Download/KisaraTranslator/sugoi_deploy/decoder_model.onnx"),
@@ -404,11 +408,12 @@ class ModelDownloader(private val context: Context) {
         try {
             val extRoot = Environment.getExternalStorageDirectory()
             val candidatePaths = listOf(
+                File(extRoot, "Download/$MODEL_SUGOI_VOCAB"),
                 File(context.getExternalFilesDir(null), "models/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_VOCAB"),
                 File(extRoot, "Download/sugoi/$MODEL_SUGOI_VOCAB"),
                 File(extRoot, "Download/sugoi_onnx/$MODEL_SUGOI_VOCAB"),
                 File(extRoot, "Download/KisaraTranslator/sugoi/$MODEL_SUGOI_VOCAB"),
-                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_VOCAB"),
                 File(extRoot, "Android/data/com.raen.kisaratranslator/files/models/sugoi/$MODEL_SUGOI_VOCAB"),
                 File(extRoot, "Android/data/com.raen.kisaratranslator.debug/files/models/sugoi/$MODEL_SUGOI_VOCAB"),
                 File(extRoot, "Android/data/com.raen.kisara/files/models/sugoi/$MODEL_SUGOI_VOCAB"),
