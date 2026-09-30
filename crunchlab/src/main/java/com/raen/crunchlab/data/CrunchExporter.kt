@@ -188,6 +188,21 @@ object CrunchExporter {
                 saveStepImage(lobesBmp, "step3_separated_lobes.png")
             }
 
+            // 6. Render Module 4 Step Images (Dialogue Data Prepare & MangaOCR)
+            if (page.m4DialogueGroups.isNotEmpty()) {
+                val m4_1Bmp = renderM4_1DataPrepare(baseBmp, page.m4DialogueGroups)
+                saveStepImage(m4_1Bmp, "m4_1_data_prepare.png")
+
+                val m4_2Bmp = renderM4_2MangaOcr(baseBmp, page.m4DialogueGroups)
+                saveStepImage(m4_2Bmp, "m4_2_manga_ocr.png")
+            }
+
+            // 7. Render Module 5 Step Image (Translation)
+            if (page.m5TranslatedGroups.isNotEmpty()) {
+                val m5Bmp = renderM5Translation(baseBmp, page.m5TranslatedGroups, page.m5EngineType)
+                saveStepImage(m5Bmp, "m5_translation.png")
+            }
+
             Log.i(TAG, "CrunchExporter: Full page debug export complete for ${page.label} (Page ${page.index})")
             return rootJsonFile
         } catch (e: Exception) {
@@ -354,6 +369,70 @@ object CrunchExporter {
         }
         root.put("module_3_waist_crunch", m3Obj)
 
+        // Module 4: Dialogue Data Prepare & MangaOCR
+        val m4Obj = JSONObject().apply {
+            val groups = page.m4DialogueGroups
+            put("status", if (groups.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("total_groups", groups.size)
+            put("bubbled_groups_count", groups.count { it.isBubble })
+            put("orphan_groups_count", groups.count { !it.isBubble })
+            put("total_lines_fed", groups.sumOf { it.lines.size })
+            put("ocr_duration_ms", page.m4OcrDurationMs)
+
+            val groupsArr = JSONArray()
+            groups.forEach { g ->
+                val gObj = JSONObject().apply {
+                    put("group_id", g.groupId)
+                    put("is_bubble", g.isBubble)
+                    if (g.bubbleIndex != null) put("bubble_index", g.bubbleIndex)
+                    put("category", g.category.name)
+                    put("left", g.bounds.left); put("top", g.bounds.top); put("right", g.bounds.right); put("bottom", g.bounds.bottom)
+                    put("width", g.bounds.width()); put("height", g.bounds.height())
+                    put("lines_count", g.lines.size)
+                    put("has_contour", g.contourPoints.isNotEmpty())
+                    put("contour_points_count", g.contourPoints.size)
+                    put("recognized_text", g.recognizedText)
+
+                    val linesArr = JSONArray()
+                    g.lines.forEach { l ->
+                        linesArr.put(JSONObject().apply {
+                            put("line_id", l.lineId)
+                            put("reading_order", l.readingOrder)
+                            put("left", l.rect.left); put("top", l.rect.top); put("right", l.rect.right); put("bottom", l.rect.bottom)
+                            put("width", l.rect.width()); put("height", l.rect.height())
+                        })
+                    }
+                    put("reading_order_lines", linesArr)
+                }
+                groupsArr.put(gObj)
+            }
+            put("groups", groupsArr)
+        }
+        root.put("module_4_ocr", m4Obj)
+
+        // Module 5: Translation
+        val m5Obj = JSONObject().apply {
+            val groups = page.m5TranslatedGroups
+            put("status", if (groups.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("engine", page.m5EngineType)
+            put("duration_ms", page.m5DurationMs)
+            put("total_groups", groups.size)
+            val groupsArr = JSONArray()
+            groups.forEach { g ->
+                groupsArr.put(JSONObject().apply {
+                    put("group_id", g.groupId)
+                    put("is_bubble", g.isBubble)
+                    put("category", g.category.name)
+                    put("recognized_text", g.recognizedText)
+                    put("translated_text", g.translatedText)
+                    put("engine", g.translationEngine)
+                    put("left", g.bounds.left); put("top", g.bounds.top); put("right", g.bounds.right); put("bottom", g.bounds.bottom)
+                })
+            }
+            put("groups", groupsArr)
+        }
+        root.put("module_5_translate", m5Obj)
+
         return root
     }
 
@@ -462,7 +541,7 @@ object CrunchExporter {
             strokeWidth = 2.2f
         }
         val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x2000E676.toInt()
+            color = 0x2000E676
             style = Paint.Style.FILL
         }
 
@@ -502,14 +581,14 @@ object CrunchExporter {
             style = Paint.Style.STROKE
             strokeWidth = 2.5f
         }
-        val passedFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2500E676.toInt(); style = Paint.Style.FILL }
+        val passedFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2500E676; style = Paint.Style.FILL }
 
         val rejectedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = 0xFFFF1744.toInt()
             style = Paint.Style.STROKE
             strokeWidth = 2.2f
         }
-        val rejectedFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x20FF1744.toInt(); style = Paint.Style.FILL }
+        val rejectedFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x20FF1744; style = Paint.Style.FILL }
 
         bubbles.forEach { b -> canvas.drawRect(b, bubblePaint) }
 
@@ -652,9 +731,9 @@ object CrunchExporter {
         val canvas = Canvas(out)
 
         val splitBoxP = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFD500F9.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.0f }
-        val normalBoxP = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x669E9E9E.toInt(); style = Paint.Style.STROKE; strokeWidth = 1.5f }
+        val normalBoxP = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x669E9E9E; style = Paint.Style.STROKE; strokeWidth = 1.5f }
         val candP = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF00E5FF.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.0f }
-        val candFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x4400E5FF.toInt(); style = Paint.Style.FILL }
+        val candFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x4400E5FF; style = Paint.Style.FILL }
         val rawPtP = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFD600.toInt(); style = Paint.Style.FILL }
 
         partitions.forEach { part ->
@@ -716,10 +795,10 @@ object CrunchExporter {
         partitions.forEach { p -> p.splitLines.forEach { sl -> lineMap[sl.id] = sl } }
 
         val lobeAPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF2979FF.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.6f }
-        val lobeAFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2A2979FF.toInt(); style = Paint.Style.FILL }
+        val lobeAFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2A2979FF; style = Paint.Style.FILL }
 
         val lobeBPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFF4081.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.6f }
-        val lobeBFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2AFFFF40.toInt(); style = Paint.Style.FILL }
+        val lobeBFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2AFFFF40; style = Paint.Style.FILL }
 
         partitions.forEach { part ->
             part.lobeALineIds.forEach { id ->
@@ -737,6 +816,253 @@ object CrunchExporter {
         }
 
         drawBannerHeader(canvas, "Step 3.3: Lobe Partitioning (Blue: Lobe A, Pink: Lobe B)", base.width)
+        return out
+    }
+
+    // Step 4.1: Dialogue Data Prepare (Colorized Actual Bubble Borders + RTL Line Badges)
+    private fun renderM4_1DataPrepare(base: Bitmap, groups: List<DialogueGroupItem>): Bitmap {
+        val out = base.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(out)
+
+        val palette = listOf(
+            0xFF00E5FF.toInt(), // Cyan
+            0xFFFFD600.toInt(), // Yellow
+            0xFFFF4081.toInt(), // Pink
+            0xFF76FF03.toInt(), // Lime
+            0xFFFF9100.toInt(), // Orange
+            0xFFE040FB.toInt(), // Purple
+            0xFF00E676.toInt(), // Green
+            0xFF40C4FF.toInt(), // Light Blue
+            0xFFFF5252.toInt(), // Red Accent
+            0xFFB388FF.toInt(), // Deep Purple Accent
+        )
+
+        groups.forEachIndexed { gIdx, group ->
+            val color = palette[gIdx % palette.size]
+            val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = color
+                style = Paint.Style.STROKE
+                strokeWidth = 3.0f
+            }
+            val fillP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = (color and 0x00FFFFFF) or 0x22000000
+                style = Paint.Style.FILL
+            }
+
+            // 1. Colorize actual bubble border contour or rounded rectangle
+            if (group.isBubble) {
+                if (group.contourPoints.size >= 3) {
+                    val path = Path().apply {
+                        val first = group.contourPoints[0]
+                        moveTo(first.x.toFloat(), first.y.toFloat())
+                        for (i in 1 until group.contourPoints.size) {
+                            val pt = group.contourPoints[i]
+                            lineTo(pt.x.toFloat(), pt.y.toFloat())
+                        }
+                        close()
+                    }
+                    canvas.drawPath(path, strokeP)
+                    canvas.drawPath(path, fillP)
+                } else {
+                    val r = RectF(group.bounds)
+                    canvas.drawRoundRect(r, 12f, 12f, strokeP)
+                    canvas.drawRoundRect(r, 12f, 12f, fillP)
+                }
+            } else {
+                // Orphan dialogue group: dashed rounded rectangle
+                val r = RectF(group.bounds)
+                val dashedP = Paint(strokeP).apply {
+                    pathEffect = DashPathEffect(floatArrayOf(8f, 6f), 0f)
+                }
+                canvas.drawRoundRect(r, 8f, 8f, dashedP)
+                canvas.drawRoundRect(r, 8f, 8f, fillP)
+            }
+
+            // 2. Draw Group Header Badge
+            val headerText = "#G${group.groupId} [${if (group.isBubble) "BUBBLE" else "ORPHAN"}]"
+            val badgeY = if (group.bounds.top > 30) group.bounds.top.toFloat() else (group.bounds.bottom + 22).toFloat()
+            drawBadgePill(canvas, headerText, group.bounds.left.toFloat(), badgeY, color, Color.BLACK, 13f)
+
+            // 3. Draw vertical lines inside group with RTL reading badges (#G1.1, #G1.2)
+            val lineStrokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = color
+                style = Paint.Style.STROKE
+                strokeWidth = 2.2f
+            }
+            val lineFillP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = (color and 0x00FFFFFF) or 0x30000000
+                style = Paint.Style.FILL
+            }
+
+            group.lines.forEach { line ->
+                canvas.drawRect(line.rect, lineStrokeP)
+                canvas.drawRect(line.rect, lineFillP)
+
+                val lineBadge = "#G${group.groupId}.${line.readingOrder}"
+                val lineBadgeY = if (line.rect.top > 20) line.rect.top.toFloat() else (line.rect.bottom + 16).toFloat()
+                drawBadgePill(canvas, lineBadge, line.rect.left.toFloat(), lineBadgeY, 0xFF141418.toInt(), color, 11f)
+            }
+        }
+
+        val bCount = groups.count { it.isBubble }
+        val oCount = groups.count { !it.isBubble }
+        drawBannerHeader(canvas, "Step 4.1: Dialogue Data Prepare (${groups.size} groups: $bCount bubbled, $oCount orphan)", base.width)
+        return out
+    }
+
+    // Step 4.2: MangaOCR Recognition Output
+    private fun renderM4_2MangaOcr(base: Bitmap, groups: List<DialogueGroupItem>): Bitmap {
+        val out = base.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(out)
+
+        val palette = listOf(
+            0xFF00E5FF.toInt(), 0xFFFFD600.toInt(), 0xFFFF4081.toInt(),
+            0xFF76FF03.toInt(), 0xFFFF9100.toInt(), 0xFFE040FB.toInt()
+        )
+
+        groups.forEachIndexed { gIdx, group ->
+            val color = palette[gIdx % palette.size]
+            val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = color
+                style = Paint.Style.STROKE
+                strokeWidth = 2.4f
+            }
+            val rF = RectF(group.bounds)
+            canvas.drawRoundRect(rF, 6f, 6f, strokeP)
+
+            // Draw recognized text pill
+            val text = group.recognizedText
+            if (text.isNotBlank()) {
+                val label = "「$text」"
+                val badgeY = (group.bounds.bottom + 22).toFloat().coerceAtMost(base.height - 10f)
+                drawBadgePill(canvas, label, group.bounds.left.toFloat(), badgeY, 0xFF181820.toInt(), Color.WHITE, 13f)
+            }
+        }
+
+        val totalChars = groups.sumOf { it.recognizedText.length }
+        drawBannerHeader(canvas, "Step 4.2: MangaOCR Text Recognition (${groups.size} groups, $totalChars characters)", base.width)
+        return out
+    }
+
+    private fun renderM5Translation(base: Bitmap, groups: List<DialogueGroupItem>, engineName: String): Bitmap {
+        val out = base.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(out)
+
+        val palette = listOf(
+            0xFF00E5FF.toInt(), 0xFFFFD600.toInt(), 0xFFFF4081.toInt(),
+            0xFF76FF03.toInt(), 0xFFFF9100.toInt(), 0xFFE040FB.toInt()
+        )
+
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+        }
+
+        val cardBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xEE1E1E28.toInt()
+            style = Paint.Style.FILL
+        }
+
+        val cardStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF5C6BC0.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1.5f
+        }
+
+        val headerTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF80D8FF.toInt()
+            textSize = 13f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+
+        val jpTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFB0BEC5.toInt()
+            textSize = 12f
+        }
+
+        val enTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 14f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+
+        groups.forEachIndexed { gIdx, group ->
+            val color = palette[gIdx % palette.size]
+            borderPaint.color = color
+
+            // 1. Draw contour if present, else round rect bounds
+            if (group.contourPoints.size >= 3) {
+                val path = Path()
+                path.moveTo(group.contourPoints[0].x.toFloat(), group.contourPoints[0].y.toFloat())
+                for (i in 1 until group.contourPoints.size) {
+                    path.lineTo(group.contourPoints[i].x.toFloat(), group.contourPoints[i].y.toFloat())
+                }
+                path.close()
+                canvas.drawPath(path, borderPaint)
+            } else {
+                canvas.drawRoundRect(RectF(group.bounds), 8f, 8f, borderPaint)
+            }
+
+            // 2. Draw Translation Card
+            val en = group.translatedText.ifBlank { "(no translation)" }
+            val jp = group.recognizedText.ifBlank { "(no OCR text)" }
+
+            val cardWidth = 220f.coerceAtLeast(group.bounds.width().toFloat().coerceAtMost(320f))
+            val pad = 10f
+
+            // Word wrap English text
+            val maxTextW = cardWidth - 2 * pad
+            val wrappedEnLines = mutableListOf<String>()
+            val words = en.split(" ")
+            var curLine = StringBuilder()
+            for (w in words) {
+                val candidate = if (curLine.isEmpty()) w else "$curLine $w"
+                if (enTextPaint.measureText(candidate) <= maxTextW) {
+                    curLine = StringBuilder(candidate)
+                } else {
+                    if (curLine.isNotEmpty()) wrappedEnLines.add(curLine.toString())
+                    curLine = StringBuilder(w)
+                }
+            }
+            if (curLine.isNotEmpty()) wrappedEnLines.add(curLine.toString())
+
+            val cardHeight = 22f + 16f + (wrappedEnLines.size * 18f) + 14f
+            var cardX = group.bounds.left.toFloat()
+            if (cardX + cardWidth > base.width - 10f) {
+                cardX = (base.width - cardWidth - 10f).coerceAtLeast(10f)
+            }
+            var cardY = group.bounds.bottom + 6f
+            if (cardY + cardHeight > base.height - 10f) {
+                cardY = (group.bounds.top - cardHeight - 6f).coerceAtLeast(30f)
+            }
+
+            val cardRect = RectF(cardX, cardY, cardX + cardWidth, cardY + cardHeight)
+            canvas.drawRoundRect(cardRect, 8f, 8f, cardBgPaint)
+            canvas.drawRoundRect(cardRect, 8f, 8f, cardStrokePaint)
+
+            // Header line: #id [BUBBLE/ORPHAN]
+            val badge = if (group.isBubble) "BUBBLE #${group.groupId}" else "ORPHAN #${group.groupId}"
+            canvas.drawText(badge, cardX + pad, cardY + 16f, headerTextPaint)
+
+            // JP line (clipped with ellipsis if too long)
+            var jpShort = "JP: $jp"
+            if (jpTextPaint.measureText(jpShort) > maxTextW) {
+                while (jpShort.length > 5 && jpTextPaint.measureText("$jpShort...") > maxTextW) {
+                    jpShort = jpShort.substring(0, jpShort.length - 1)
+                }
+                jpShort = "$jpShort..."
+            }
+            canvas.drawText(jpShort, cardX + pad, cardY + 32f, jpTextPaint)
+
+            // EN lines
+            var lineY = cardY + 50f
+            for (line in wrappedEnLines) {
+                canvas.drawText(line, cardX + pad, lineY, enTextPaint)
+                lineY += 18f
+            }
+        }
+
+        drawBannerHeader(canvas, "Module 5: Translation [$engineName] (${groups.size} groups)", base.width)
         return out
     }
 
@@ -866,7 +1192,7 @@ object CrunchExporter {
         val out = base.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(out)
         val splitBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x8000E676.toInt(); style = Paint.Style.STROKE; strokeWidth = 1.2f }
-        val unsplitBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x559E9E9E.toInt(); style = Paint.Style.STROKE; strokeWidth = 1.2f; pathEffect = DashPathEffect(floatArrayOf(5f, 5f), 0f) }
+        val unsplitBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x559E9E9E; style = Paint.Style.STROKE; strokeWidth = 1.2f; pathEffect = DashPathEffect(floatArrayOf(5f, 5f), 0f) }
         for (split in splits) {
             canvas.drawRect(split.originalRect, if (split.wasSplit) splitBoxPaint else unsplitBoxPaint)
         }
@@ -894,8 +1220,8 @@ object CrunchExporter {
     private fun renderLegacyStep3(base: Bitmap, splits: List<PureBorderAngleSplitter.SplitResult>): Bitmap {
         val out = base.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(out)
-        val cyanFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x3300E5FF.toInt(); style = Paint.Style.FILL }
-        val emeraldFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x3300E676.toInt(); style = Paint.Style.FILL }
+        val cyanFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x3300E5FF; style = Paint.Style.FILL }
+        val emeraldFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x3300E676; style = Paint.Style.FILL }
         for (split in splits) {
             if (!split.wasSplit) continue
             split.splitLobeRects.forEachIndexed { idx, lobeRect ->

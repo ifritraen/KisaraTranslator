@@ -69,7 +69,7 @@ class ModelDownloader(private val context: Context) {
         const val MODEL_MANGA_OCR_TOKENIZER = "tokenizer.json"
 
         const val MIN_SIZE_OCR_ENCODER = 15 * 1024 * 1024L  // ~21 MB
-        const val MIN_SIZE_OCR_DECODER = 50 * 1024 * 1024L  // ~113 MB (FP32 Original)
+        const val MIN_SIZE_OCR_DECODER = 20 * 1024 * 1024L  // ~28 MB (Quantized) or ~113 MB (FP32)
         const val MIN_SIZE_OCR_TOKENIZER = 50 * 1024L       // ~115 KB
 
         val MIRRORS_OCR_ENCODER = listOf(
@@ -89,6 +89,15 @@ class ModelDownloader(private val context: Context) {
             "https://hf-mirror.com/l0wgear/manga-ocr-2025-onnx/resolve/main/tokenizer.json",
             "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/raw/main/tokenizer.json",
         )
+
+        // Sugoi ONNX Models
+        const val MODEL_SUGOI_ENCODER = "encoder_model_quantized.onnx"
+        const val MODEL_SUGOI_DECODER = "decoder_model_quantized.onnx"
+        const val MODEL_SUGOI_VOCAB = "sugoi_vocab.json"
+
+        const val MIN_SIZE_SUGOI_ENCODER = 30 * 1024 * 1024L
+        const val MIN_SIZE_SUGOI_DECODER = 40 * 1024 * 1024L
+        const val MIN_SIZE_SUGOI_VOCAB = 500 * 1024L
     }
 
     fun getModelFile(): File = getBubbleModelFile()
@@ -307,6 +316,122 @@ class ModelDownloader(private val context: Context) {
         } catch (_: Exception) {}
 
         return internalFile
+    }
+
+    fun getSugoiDir(): File {
+        return File(context.filesDir, "models/sugoi").apply { mkdirs() }
+    }
+
+    fun getSugoiEncoderFile(): File {
+        val dir = getSugoiDir()
+        val internalFile = File(dir, MODEL_SUGOI_ENCODER)
+        if (internalFile.exists() && internalFile.length() >= MIN_SIZE_SUGOI_ENCODER) {
+            return internalFile
+        }
+
+        try {
+            val extRoot = Environment.getExternalStorageDirectory()
+            val candidatePaths = listOf(
+                File(context.getExternalFilesDir(null), "models/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Download/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Download/sugoi_onnx/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Download/KisaraTranslator/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Android/data/com.raen.kisaratranslator/files/models/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Android/data/com.raen.kisaratranslator.debug/files/models/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "Android/data/com.raen.kisara/files/models/sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, "sugoi/$MODEL_SUGOI_ENCODER"),
+                File(extRoot, MODEL_SUGOI_ENCODER),
+                // Quantized or FP32 fallback
+                File(context.getExternalFilesDir(null), "models/sugoi/encoder_model.onnx"),
+                File(extRoot, "Download/sugoi/encoder_model.onnx"),
+                File(extRoot, "Download/sugoi_onnx/encoder_model.onnx"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/encoder_model.onnx"),
+            )
+            for (cand in candidatePaths) {
+                if (cand.exists() && cand.length() >= MIN_SIZE_SUGOI_ENCODER && cand.canRead()) {
+                    return cand
+                }
+            }
+        } catch (_: Exception) {}
+
+        return internalFile
+    }
+
+    fun getSugoiDecoderFile(): File {
+        val dir = getSugoiDir()
+        val internalFile = File(dir, MODEL_SUGOI_DECODER)
+        if (internalFile.exists() && internalFile.length() >= MIN_SIZE_SUGOI_DECODER) {
+            return internalFile
+        }
+
+        try {
+            val extRoot = Environment.getExternalStorageDirectory()
+            val candidatePaths = listOf(
+                File(context.getExternalFilesDir(null), "models/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Download/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Download/sugoi_onnx/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Download/KisaraTranslator/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Android/data/com.raen.kisaratranslator/files/models/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Android/data/com.raen.kisaratranslator.debug/files/models/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "Android/data/com.raen.kisara/files/models/sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, "sugoi/$MODEL_SUGOI_DECODER"),
+                File(extRoot, MODEL_SUGOI_DECODER),
+                // Quantized or FP32 fallback
+                File(context.getExternalFilesDir(null), "models/sugoi/decoder_model.onnx"),
+                File(extRoot, "Download/sugoi/decoder_model.onnx"),
+                File(extRoot, "Download/sugoi_onnx/decoder_model.onnx"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/decoder_model.onnx"),
+            )
+            for (cand in candidatePaths) {
+                if (cand.exists() && cand.length() >= MIN_SIZE_SUGOI_DECODER && cand.canRead()) {
+                    return cand
+                }
+            }
+        } catch (_: Exception) {}
+
+        return internalFile
+    }
+
+    fun getSugoiVocabFile(): File {
+        val dir = getSugoiDir()
+        val internalFile = File(dir, MODEL_SUGOI_VOCAB)
+        if (internalFile.exists() && internalFile.length() >= MIN_SIZE_SUGOI_VOCAB) {
+            return internalFile
+        }
+
+        try {
+            val extRoot = Environment.getExternalStorageDirectory()
+            val candidatePaths = listOf(
+                File(context.getExternalFilesDir(null), "models/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Download/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Download/sugoi_onnx/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Download/KisaraTranslator/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Download/KisaraTranslator/sugoi_deploy/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Android/data/com.raen.kisaratranslator/files/models/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Android/data/com.raen.kisaratranslator.debug/files/models/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "Android/data/com.raen.kisara/files/models/sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, "sugoi/$MODEL_SUGOI_VOCAB"),
+                File(extRoot, MODEL_SUGOI_VOCAB),
+            )
+            for (cand in candidatePaths) {
+                if (cand.exists() && cand.length() >= MIN_SIZE_SUGOI_VOCAB && cand.canRead()) {
+                    return cand
+                }
+            }
+        } catch (_: Exception) {}
+
+        return internalFile
+    }
+
+    fun isSugoiReady(): Boolean {
+        val enc = getSugoiEncoderFile()
+        val dec = getSugoiDecoderFile()
+        val voc = getSugoiVocabFile()
+        return enc.exists() && enc.length() >= MIN_SIZE_SUGOI_ENCODER &&
+               dec.exists() && dec.length() >= MIN_SIZE_SUGOI_DECODER &&
+               voc.exists() && voc.length() >= MIN_SIZE_SUGOI_VOCAB
     }
 
     fun isMangaOcrReady(): Boolean {

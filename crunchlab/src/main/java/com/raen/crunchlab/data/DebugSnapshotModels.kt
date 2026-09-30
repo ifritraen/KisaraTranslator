@@ -88,6 +88,108 @@ data class ReadingGroupItem(
     }
 }
 
+data class DialogueLineItem(
+    val lineId: Int,
+    val rect: Rect,
+    val readingOrder: Int, // 1, 2, 3... within group (RTL order)
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("lineId", lineId)
+        put("l", rect.left)
+        put("t", rect.top)
+        put("r", rect.right)
+        put("b", rect.bottom)
+        put("order", readingOrder)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject): DialogueLineItem = DialogueLineItem(
+            lineId = obj.getInt("lineId"),
+            rect = Rect(obj.getInt("l"), obj.getInt("t"), obj.getInt("r"), obj.getInt("b")),
+            readingOrder = obj.optInt("order", 1)
+        )
+    }
+}
+
+data class DialogueGroupItem(
+    val groupId: Int,
+    val isBubble: Boolean,
+    val bubbleIndex: Int?,
+    val bounds: Rect,
+    val lines: List<DialogueLineItem>,
+    val category: TextCategory,
+    val contourPoints: List<Point> = emptyList(),
+    val recognizedText: String = "",
+    val translatedText: String = "",
+    val translationEngine: String = "",
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("groupId", groupId)
+        put("isBubble", isBubble)
+        if (bubbleIndex != null) put("bubbleIndex", bubbleIndex)
+        put("l", bounds.left)
+        put("t", bounds.top)
+        put("r", bounds.right)
+        put("b", bounds.bottom)
+        put("category", category.name)
+        val lArr = JSONArray()
+        lines.forEach { lArr.put(it.toJson()) }
+        put("lines", lArr)
+        if (contourPoints.isNotEmpty()) {
+            val cArr = JSONArray()
+            contourPoints.forEach { pt ->
+                cArr.put(JSONObject().apply { put("x", pt.x); put("y", pt.y) })
+            }
+            put("contour", cArr)
+        }
+        if (recognizedText.isNotEmpty()) put("text", recognizedText)
+        if (translatedText.isNotEmpty()) put("translation", translatedText)
+        if (translationEngine.isNotEmpty()) put("engine", translationEngine)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject): DialogueGroupItem {
+            val lArr = obj.optJSONArray("lines") ?: JSONArray()
+            val linesList = mutableListOf<DialogueLineItem>()
+            for (i in 0 until lArr.length()) {
+                linesList.add(DialogueLineItem.fromJson(lArr.getJSONObject(i)))
+            }
+            val cArr = obj.optJSONArray("contour")
+            val cList = mutableListOf<Point>()
+            if (cArr != null) {
+                for (i in 0 until cArr.length()) {
+                    val o = cArr.optJSONObject(i) ?: continue
+                    cList.add(Point(o.getInt("x"), o.getInt("y")))
+                }
+            }
+            return DialogueGroupItem(
+                groupId = obj.getInt("groupId"),
+                isBubble = obj.optBoolean("isBubble", true),
+                bubbleIndex = if (obj.has("bubbleIndex")) obj.getInt("bubbleIndex") else null,
+                bounds = Rect(obj.getInt("l"), obj.getInt("t"), obj.getInt("r"), obj.getInt("b")),
+                lines = linesList,
+                category = try {
+                    TextCategory.valueOf(obj.optString("category", TextCategory.BUBBLED.name))
+                } catch (_: Exception) { TextCategory.BUBBLED },
+                contourPoints = cList,
+                recognizedText = obj.optString("text", ""),
+                translatedText = obj.optString("translation", ""),
+                translationEngine = obj.optString("engine", "")
+            )
+        }
+    }
+}
+
+data class OcrCropDebugItem(
+    val index: Int,
+    val groupId: Int,
+    val rect: Rect,
+    val cropBitmap: Bitmap?,
+    val rawText: String,
+    val isBubble: Boolean = true,
+    val durationMs: Long = 0L,
+)
+
 data class CrunchPartitionItem(
     val bubbleIndex: Int,
     val bubbleRect: Rect,
@@ -190,7 +292,10 @@ data class DebugModuleSnapshot(
     val module2VerticalLines: List<TextLineItem> = emptyList(),
     val module2ConjoinedSplitBubbles: List<Rect> = emptyList(),
     val module2Groups: List<ReadingGroupItem> = emptyList(),
-    val module3Partitions: List<CrunchPartitionItem> = emptyList()
+    val module3Partitions: List<CrunchPartitionItem> = emptyList(),
+    val module4DialogueGroups: List<DialogueGroupItem> = emptyList(),
+    val module5DialogueGroups: List<DialogueGroupItem> = emptyList(),
+    val module5EngineType: String = "",
 ) {
     fun toJson(): String {
         val root = JSONObject().apply {
@@ -216,6 +321,9 @@ data class DebugModuleSnapshot(
             })
             put("m2", JSONArray().apply { module2Groups.forEach { put(it.toJson()) } })
             put("m3", JSONArray().apply { module3Partitions.forEach { put(it.toJson()) } })
+            put("m4Groups", JSONArray().apply { module4DialogueGroups.forEach { put(it.toJson()) } })
+            put("m5Groups", JSONArray().apply { module5DialogueGroups.forEach { put(it.toJson()) } })
+            if (module5EngineType.isNotEmpty()) put("m5Engine", module5EngineType)
         }
         return root.toString(2)
     }
@@ -261,6 +369,15 @@ data class DebugModuleSnapshot(
             val m3 = mutableListOf<CrunchPartitionItem>()
             for (i in 0 until m3Arr.length()) m3.add(CrunchPartitionItem.fromJson(m3Arr.getJSONObject(i)))
 
+            val m4Arr = root.optJSONArray("m4Groups") ?: JSONArray()
+            val m4 = mutableListOf<DialogueGroupItem>()
+            for (i in 0 until m4Arr.length()) m4.add(DialogueGroupItem.fromJson(m4Arr.getJSONObject(i)))
+
+            val m5Arr = root.optJSONArray("m5Groups") ?: JSONArray()
+            val m5 = mutableListOf<DialogueGroupItem>()
+            for (i in 0 until m5Arr.length()) m5.add(DialogueGroupItem.fromJson(m5Arr.getJSONObject(i)))
+            val m5Eng = root.optString("m5Engine", "")
+
             return DebugModuleSnapshot(
                 slotName = slot,
                 timestamp = ts,
@@ -271,7 +388,10 @@ data class DebugModuleSnapshot(
                 module2VerticalLines = if (m2Lines.isNotEmpty()) m2Lines else m2.mapIndexed { idx, g -> TextLineItem(idx + 1, g.boundingBox, 0f, 1f) },
                 module2ConjoinedSplitBubbles = m2SplitBubbles,
                 module2Groups = m2,
-                module3Partitions = m3
+                module3Partitions = m3,
+                module4DialogueGroups = m4,
+                module5DialogueGroups = m5,
+                module5EngineType = m5Eng,
             )
         }
     }
@@ -303,5 +423,14 @@ data class ProcessedPage(
     val m2ConjoinedSplitBubbles: List<Rect> = emptyList(),
     val m2SuppressedFuriganaCount: Int = 0,
     // Module 3 Data:
-    val m3Partitions: List<CrunchPartitionItem> = emptyList()
+    val m3Partitions: List<CrunchPartitionItem> = emptyList(),
+    // Module 4 Data (Data Prepare & MangaOCR):
+    val m4DialogueGroups: List<DialogueGroupItem> = emptyList(),
+    val m4OcrBlocks: List<TranslationBlock> = emptyList(),
+    val m4OcrCrops: List<OcrCropDebugItem> = emptyList(),
+    val m4OcrDurationMs: Long = 0L,
+    // Module 5 Data (Translation):
+    val m5TranslatedGroups: List<DialogueGroupItem> = emptyList(),
+    val m5EngineType: String = "",
+    val m5DurationMs: Long = 0L,
 )

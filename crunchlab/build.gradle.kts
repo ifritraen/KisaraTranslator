@@ -84,5 +84,8 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
 
+    // Google ML Kit Translation
+    implementation("com.google.mlkit:translate:17.0.3")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

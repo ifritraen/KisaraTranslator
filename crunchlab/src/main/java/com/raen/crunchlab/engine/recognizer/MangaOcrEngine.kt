@@ -9,15 +9,32 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.util.Log
+import com.raen.crunchlab.data.DialogueGroupItem
 import com.raen.crunchlab.data.ModelDownloader
+import com.raen.crunchlab.data.OcrCropDebugItem
+import com.raen.crunchlab.data.TranslationBlock
 import com.raen.crunchlab.util.AiBufferUtils
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.Closeable
 import java.io.File
 import java.nio.LongBuffer
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
+import kotlin.math.min
+
+data class DialogueOcrResult(
+    val blocks: List<TranslationBlock>,
+    val crops: List<OcrCropDebugItem>,
+    val updatedGroups: List<DialogueGroupItem>,
+    val durationMs: Long
+)
 
 data class ProbedBoxResult(
     val isValid: Boolean,
@@ -248,6 +265,165 @@ class MangaOcrEngine(
             rawCrop.recycle()
             zoomedCrop.recycle()
         }
+    }
+
+    /**
+     * Executes MangaOCR text recognition over dialogue groups (Screen 4.2).
+     * Adapted directly from KisaraTranslator's production executeOcrMethod8 pipeline:
+     * - Multi-line sweet-spot: units with <= chunkLinesCount lines fed directly in 1 pass.
+     * - Larger units: sliced into <= chunkLinesCount chunks in RTL order and joined.
+     * - Semaphore-throttled concurrency (2 parallel workers) to prevent CPU/RAM thermal spikes.
+     */
+    suspend fun executeDialogueOcr(
+        bitmap: Bitmap,
+        groups: List<DialogueGroupItem>,
+        chunkLinesCount: Int = 2,
+        onProgress: (done: Int, total: Int, currentText: String) -> Unit = { _, _, _ -> },
+    ): DialogueOcrResult = withContext(Dispatchers.Default) {
+        val startTime = System.currentTimeMillis()
+        if (groups.isEmpty()) {
+            return@withContext DialogueOcrResult(emptyList(), emptyList(), emptyList(), 0L)
+        }
+
+        ensureSessions(requireInt8 = true)
+        val semaphore = Semaphore(2)
+        val completedCounter = AtomicInteger(0)
+        val total = groups.size
+
+        val intermediateResults = coroutineScope {
+            groups.mapIndexed { unitIdx, group ->
+                async(Dispatchers.Default) {
+                    if (group.lines.isEmpty()) {
+                        val done = completedCounter.incrementAndGet()
+                        onProgress(done, total, "")
+                        return@async Triple(null, emptyList<OcrCropDebugItem>(), group)
+                    }
+
+                    if (group.lines.size <= chunkLinesCount) {
+                        // Sweet-spot: direct multi-line OCR in 1 pass
+                        val pad = 8
+                        val safeLeft = (group.bounds.left - pad).coerceIn(0, bitmap.width - 1)
+                        val safeTop = (group.bounds.top - pad).coerceIn(0, bitmap.height - 1)
+                        val safeRight = (group.bounds.right + pad).coerceIn(safeLeft + 1, bitmap.width)
+                        val safeBottom = (group.bounds.bottom + pad).coerceIn(safeTop + 1, bitmap.height)
+                        val crop = Bitmap.createBitmap(bitmap, safeLeft, safeTop, safeRight - safeLeft, safeBottom - safeTop)
+
+                        val text = try {
+                            semaphore.withPermit {
+                                recognize(crop, requireInt8 = true, maxTokens = 48).trim()
+                            }
+                        } catch (e: Exception) {
+                            Log.w("MangaOcrEngine", "Error recognizing group #${group.groupId}: ${e.message}")
+                            ""
+                        }
+
+                        val done = completedCounter.incrementAndGet()
+                        onProgress(done, total, text)
+
+                        val cropDebug = OcrCropDebugItem(
+                            index = unitIdx,
+                            groupId = group.groupId,
+                            rect = group.bounds,
+                            cropBitmap = crop.copy(crop.config ?: Bitmap.Config.ARGB_8888, false),
+                            rawText = text,
+                            isBubble = group.isBubble,
+                        )
+                        crop.recycle()
+
+                        val updatedGroup = group.copy(recognizedText = text)
+                        val block = if (text.isNotBlank()) {
+                            TranslationBlock(
+                                text = text,
+                                width = group.bounds.width().toFloat(),
+                                height = group.bounds.height().toFloat(),
+                                x = group.bounds.left.toFloat(),
+                                y = group.bounds.top.toFloat(),
+                                symWidth = group.bounds.width().toFloat() / max(text.length, 1),
+                                symHeight = group.bounds.height().toFloat() / max(text.length, 1),
+                                angle = if (group.bounds.height() > group.bounds.width() * 1.3f) 90f else 0f,
+                                isBubble = group.isBubble,
+                            )
+                        } else null
+
+                        Triple(block, listOf(cropDebug), updatedGroup)
+                    } else {
+                        // Large group: chunk into slices of <= chunkLinesCount lines in RTL reading order
+                        val chunks = group.lines.chunked(chunkLinesCount)
+                        val chunkTexts = mutableListOf<String>()
+                        val chunkCrops = mutableListOf<OcrCropDebugItem>()
+
+                        for ((chunkIdx, chunkLines) in chunks.withIndex()) {
+                            val minX = chunkLines.minOf { it.rect.left }
+                            val minY = chunkLines.minOf { it.rect.top }
+                            val maxX = chunkLines.maxOf { it.rect.right }
+                            val maxY = chunkLines.maxOf { it.rect.bottom }
+
+                            val pad = 8
+                            val safeLeft = (minX - pad).coerceIn(0, bitmap.width - 1)
+                            val safeTop = (minY - pad).coerceIn(0, bitmap.height - 1)
+                            val safeRight = (maxX + pad).coerceIn(safeLeft + 1, bitmap.width)
+                            val safeBottom = (maxY + pad).coerceIn(safeTop + 1, bitmap.height)
+                            val chunkCrop = Bitmap.createBitmap(bitmap, safeLeft, safeTop, safeRight - safeLeft, safeBottom - safeTop)
+
+                            val cText = try {
+                                semaphore.withPermit {
+                                    recognize(chunkCrop, requireInt8 = true, maxTokens = 36).trim()
+                                }
+                            } catch (e: Exception) {
+                                Log.w("MangaOcrEngine", "Error recognizing chunk $chunkIdx of group #${group.groupId}: ${e.message}")
+                                ""
+                            }
+                            chunkTexts.add(cText)
+
+                            chunkCrops.add(
+                                OcrCropDebugItem(
+                                    index = unitIdx * 100 + chunkIdx,
+                                    groupId = group.groupId,
+                                    rect = Rect(safeLeft, safeTop, safeRight, safeBottom),
+                                    cropBitmap = chunkCrop.copy(chunkCrop.config ?: Bitmap.Config.ARGB_8888, false),
+                                    rawText = cText,
+                                    isBubble = group.isBubble,
+                                )
+                            )
+                            chunkCrop.recycle()
+                        }
+
+                        val done = completedCounter.incrementAndGet()
+                        val fullText = chunkTexts.filter { it.isNotBlank() }.joinToString("")
+                        onProgress(done, total, fullText)
+
+                        val updatedGroup = group.copy(recognizedText = fullText)
+                        val block = if (fullText.isNotBlank()) {
+                            TranslationBlock(
+                                text = fullText,
+                                width = group.bounds.width().toFloat(),
+                                height = group.bounds.height().toFloat(),
+                                x = group.bounds.left.toFloat(),
+                                y = group.bounds.top.toFloat(),
+                                symWidth = group.bounds.width().toFloat() / max(fullText.length, 1),
+                                symHeight = group.bounds.height().toFloat() / max(fullText.length, 1),
+                                angle = if (group.bounds.height() > group.bounds.width() * 1.3f) 90f else 0f,
+                                isBubble = group.isBubble,
+                            )
+                        } else null
+
+                        Triple(block, chunkCrops, updatedGroup)
+                    }
+                }
+            }.awaitAll()
+        }
+
+        val allBlocks = intermediateResults.mapNotNull { it.first }
+        val allCrops = intermediateResults.flatMap { it.second }
+        val updatedGroups = intermediateResults.map { it.third }
+        val durationMs = System.currentTimeMillis() - startTime
+
+        DialogueOcrResult(
+            blocks = allBlocks,
+            crops = allCrops,
+            updatedGroups = updatedGroups,
+            durationMs = durationMs
+        )
     }
 
     private fun isBlankOrSolid(bitmap: Bitmap): Boolean {

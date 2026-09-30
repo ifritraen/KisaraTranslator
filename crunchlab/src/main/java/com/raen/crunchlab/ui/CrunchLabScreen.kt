@@ -81,13 +81,22 @@ import com.raen.crunchlab.data.ReadingGroupItem
 import com.raen.crunchlab.data.TextCategory
 import com.raen.crunchlab.data.TextLineItem
 import com.raen.crunchlab.data.TextOrientation
+import com.raen.crunchlab.data.DialogueGroupItem
+import com.raen.crunchlab.data.DialogueLineItem
+import com.raen.crunchlab.data.OcrCropDebugItem
 import com.raen.crunchlab.data.TranslationBlock
 import com.raen.crunchlab.engine.BubbleMask
 import com.raen.crunchlab.engine.BubbleSegmentationEngine
 import com.raen.crunchlab.engine.ComicTextDetector
 import com.raen.crunchlab.engine.Method3WaistEngine
+import com.raen.crunchlab.engine.grouping.DialogueGroupPreparer
 import com.raen.crunchlab.engine.grouping.TextCategorizer
 import com.raen.crunchlab.engine.grouping.VerticalLineStitcher
+import com.raen.crunchlab.engine.recognizer.MangaOcrEngine
+import com.raen.crunchlab.engine.translator.GoogleTranslator
+import com.raen.crunchlab.engine.translator.MLKitTranslator
+import com.raen.crunchlab.engine.translator.SugoiTranslator
+import com.raen.crunchlab.engine.translator.TextTranslator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -123,6 +132,7 @@ data class BoxInspectionInfo(
     val subtitle: String,
     val dimensions: String,
     val recognizedText: String? = null,
+    val translatedText: String? = null,
     val confidence: String? = null,
     val tagColor: Color = Color(0xFF00E5FF),
     val rect: Rect,
@@ -133,7 +143,15 @@ enum class DebugModule(val id: Int, val shortTag: String, val shortName: String,
     MODULE_1_CTD(1, "M1", "M1: CTD Text", "Module 1: Comic Text Detector"),
     MODULE_1_5_CATEGORIZE(2, "M1.5", "M1.5: Categorize", "Module 1.5: Text Categorization (Bubbled/Orphan/SFX)"),
     MODULE_2_LINES(3, "M2", "M2: Vertical Lines", "Module 2: Single Vertical Lines"),
-    MODULE_3_CRUNCH(4, "M3", "M3: Waist Crunch", "Module 3: Waist Crunch (Method 3)")
+    MODULE_3_CRUNCH(4, "M3", "M3: Waist Crunch", "Module 3: Waist Crunch (Method 3)"),
+    MODULE_4_OCR(5, "M4", "M4: MangaOCR", "Module 4: Dialogue Grouping & MangaOCR"),
+    MODULE_5_TRANSLATE(6, "M5", "M5: Translate", "Module 5: Text Translation (Google / ML Kit / Sugoi)")
+}
+
+enum class TranslationEngineType(val displayName: String, val badge: String) {
+    GOOGLE("Google Translate", "🌐 Google"),
+    MLKIT("Google ML Kit", "📱 ML Kit"),
+    SUGOI("Sugoi ONNX", "🤖 Sugoi")
 }
 
 enum class M1SubStep(val id: Int, val label: String) {
@@ -160,6 +178,11 @@ enum class M3SubStep(val id: Int, val label: String) {
     LOBE_PARTITION(2, "3.3 Lobe A/B Partition")
 }
 
+enum class M4SubStep(val id: Int, val label: String) {
+    DATA_PREPARE(0, "4.1 Data Prepare"),
+    OCR_OUTPUT(1, "4.2 OCR Output")
+}
+
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun CrunchLabScreen() {
@@ -172,6 +195,10 @@ fun CrunchLabScreen() {
     val segEngine = remember { BubbleSegmentationEngine(downloader) }
     val ctdEngine = remember { ComicTextDetector(downloader) }
     val method3WaistEngine = remember { Method3WaistEngine(downloader) }
+    val mangaOcrEngine = remember { MangaOcrEngine(downloader) }
+    val googleTranslator = remember { GoogleTranslator() }
+    val mlkitTranslator = remember { MLKitTranslator() }
+    val sugoiTranslator = remember { SugoiTranslator(downloader) }
     val snapshotManager = remember { DebugSnapshotManager(context) }
 
     val downloadProgress by downloader.progress.collectAsState()
@@ -181,6 +208,10 @@ fun CrunchLabScreen() {
             segEngine.close()
             ctdEngine.close()
             method3WaistEngine.close()
+            mangaOcrEngine.close()
+            googleTranslator.close()
+            mlkitTranslator.close()
+            sugoiTranslator.close()
         }
     }
 
@@ -194,6 +225,9 @@ fun CrunchLabScreen() {
     var m1_5SubStep by remember { mutableStateOf(M1_5SubStep.ALL) }
     var m2SubStep by remember { mutableStateOf(M2SubStep.ALL_LINES) }
     var m3SubStep by remember { mutableStateOf(M3SubStep.LOBE_PARTITION) }
+    var m4SubStep by remember { mutableStateOf(M4SubStep.DATA_PREPARE) }
+    var selectedEngine by remember { mutableStateOf(TranslationEngineType.GOOGLE) }
+    var sugoiBeamWidth by remember { mutableIntStateOf(1) }
 
     var processedPages by remember { mutableStateOf<List<ProcessedPage>>(emptyList()) }
     var activePageIndex by remember { mutableIntStateOf(0) }
@@ -215,6 +249,8 @@ fun CrunchLabScreen() {
                 ctdEngine.releaseInferenceBuffers()
                 segEngine.close()
                 method3WaistEngine.close()
+                mangaOcrEngine.close()
+                sugoiTranslator.close()
                 System.gc()
                 System.runFinalization()
                 Log.i("CrunchLab", "3-second auto-cleanup: Released ONNX sessions, native buffers, and executed GC")
@@ -283,9 +319,16 @@ fun CrunchLabScreen() {
                     isProcessing = false
                     return@launch
                 }
-                if (targetModule == DebugModule.MODULE_3_CRUNCH) {
+                if (targetModule == DebugModule.MODULE_3_CRUNCH || targetModule == DebugModule.MODULE_4_OCR || targetModule == DebugModule.MODULE_5_TRANSLATE) {
                     if (!downloader.isBubbleModelReady() || !downloader.isWaistModelReady()) {
                         statusMessage = "BubbleSeg or Waist model missing (place manga_waist_model.onnx in Download)."
+                        isProcessing = false
+                        return@launch
+                    }
+                }
+                if (targetModule == DebugModule.MODULE_5_TRANSLATE && selectedEngine == TranslationEngineType.SUGOI) {
+                    if (!downloader.isSugoiReady()) {
+                        statusMessage = "Sugoi ONNX missing. Place encoder, decoder & sugoi_vocab.json in Download/sugoi."
                         isProcessing = false
                         return@launch
                     }
@@ -319,20 +362,25 @@ fun CrunchLabScreen() {
                 if (targetModule.id >= 2) {
                     val needM1_5 = needM1 || curr.m1_5CategorizedBoxes.isEmpty() || targetModule == DebugModule.MODULE_1_5_CATEGORIZE || forceUpstream
                     if (needM1_5) {
-                        val masks = if (curr.detectedMasks.isNotEmpty() && !forceUpstream) {
-                            curr.detectedMasks
+                        val (masks, splitBubbles, parts) = if (curr.detectedMasks.isNotEmpty() && !forceUpstream) {
+                            Triple(curr.detectedMasks, curr.m2ConjoinedSplitBubbles, curr.m3Partitions)
                         } else {
                             statusMessage = "[M1.5] Running Manga109 bubble segmentation..."
-                            withContext(Dispatchers.Default) {
+                            val rawMasks = withContext(Dispatchers.Default) {
                                 segEngine.detectMasks(bmp)
                             }
+                            statusMessage = "[M1.5] Pre-partitioning conjoined bubble lobes..."
+                            val (partitionedMasks, partitionedBubbles, partitions) = withContext(Dispatchers.Default) {
+                                method3WaistEngine.partitionConjoinedBubbles(bmp, rawMasks, curr.m1Bubbles)
+                            }
+                            Triple(partitionedMasks, partitionedBubbles, partitions)
                         }
 
                         statusMessage = "[M1.5] Categorizing character boxes into Bubbled, Orphan, and SFX..."
                         val catRes = withContext(Dispatchers.Default) {
                             TextCategorizer.categorizeBoxes(
                                 rawBoxes = curr.m1Lines.map { it.rect },
-                                bubbleRegions = curr.m1Bubbles,
+                                bubbleRegions = if (splitBubbles.isNotEmpty()) splitBubbles else curr.m1Bubbles,
                                 bubbleMasks = masks,
                                 bitmap = bmp,
                                 bitmapWidth = bmp.width,
@@ -342,6 +390,8 @@ fun CrunchLabScreen() {
                         }
                         curr = curr.copy(
                             detectedMasks = masks,
+                            m2ConjoinedSplitBubbles = splitBubbles,
+                            m3Partitions = parts,
                             m1_5CategorizedBoxes = catRes.allBoxes,
                             m1_5BubbledCount = catRes.bubbledBoxes.size,
                             m1_5OrphanCount = catRes.orphanBoxes.size,
@@ -359,10 +409,11 @@ fun CrunchLabScreen() {
                         val rawBoxes = curr.m1_5CategorizedBoxes.ifEmpty {
                             curr.m1Lines.map { it.copy(category = TextCategory.BUBBLED) }
                         }
+                        val bubbleRegions = if (curr.m2ConjoinedSplitBubbles.isNotEmpty()) curr.m2ConjoinedSplitBubbles else curr.m1Bubbles
                         val stitchedOut = withContext(Dispatchers.Default) {
                             VerticalLineStitcher.stitchLines(
                                 categorizedBoxes = rawBoxes,
-                                bubbleRegions = curr.m1Bubbles,
+                                bubbleRegions = bubbleRegions,
                                 bubbleMasks = masks,
                                 bitmap = bmp,
                                 bitmapWidth = bmp.width,
@@ -370,31 +421,37 @@ fun CrunchLabScreen() {
                                 isRtl = true
                             )
                         }
+                        val updatedPartitions = if (curr.m3Partitions.isNotEmpty()) {
+                            method3WaistEngine.assignPartitionLines(curr.m3Partitions, stitchedOut.allLines)
+                        } else emptyList()
                         curr = curr.copy(
                             m2VerticalLines = stitchedOut.allLines,
-                            m2SuppressedFuriganaCount = stitchedOut.suppressedFuriganaCount
+                            m2SuppressedFuriganaCount = stitchedOut.suppressedFuriganaCount,
+                            m3Partitions = if (updatedPartitions.isNotEmpty()) updatedPartitions else curr.m3Partitions
                         )
                     }
                 }
 
                 // Target: Module 3 (Waist Crunch Method 3)
                 if (targetModule.id >= 4) {
-                    val masks = if (curr.detectedMasks.isNotEmpty() && !forceUpstream) {
-                        curr.detectedMasks
+                    val (masks, splitBubbles, initialPartitions) = if (curr.detectedMasks.isNotEmpty() && !forceUpstream) {
+                        Triple(curr.detectedMasks, curr.m2ConjoinedSplitBubbles, curr.m3Partitions)
                     } else {
-                        statusMessage = "[M3] Running Manga109 bubble segmentation..."
-                        withContext(Dispatchers.Default) {
+                        statusMessage = "[M3] Running Manga109 bubble segmentation & conjoined pre-partitioning..."
+                        val rawMasks = withContext(Dispatchers.Default) {
                             segEngine.detectMasks(bmp)
                         }
+                        val (partitionedMasks, partitionedBubbles, parts) = withContext(Dispatchers.Default) {
+                            method3WaistEngine.partitionConjoinedBubbles(bmp, rawMasks, curr.m1Bubbles)
+                        }
+                        Triple(partitionedMasks, partitionedBubbles, parts)
                     }
 
-                    statusMessage = "[M3] Waist prediction, auto-suggest candidates & lobe partitioning (${masks.size} bubbles)..."
+                    statusMessage = "[M3] Assigning vertical lines to lobes (${masks.size} bubble lobes)..."
                     val partitions = withContext(Dispatchers.Default) {
-                        method3WaistEngine.processPage(
-                            bitmap = bmp,
-                            masks = masks,
-                            textLines = curr.m2VerticalLines.ifEmpty { curr.m1Lines },
-                            readingGroups = emptyList()
+                        method3WaistEngine.assignPartitionLines(
+                            initialPartitions,
+                            curr.m2VerticalLines.ifEmpty { curr.m1Lines }
                         )
                     }
 
@@ -406,8 +463,99 @@ fun CrunchLabScreen() {
                     curr = curr.copy(
                         isolatedBitmap = isolated,
                         detectedMasks = masks,
+                        m2ConjoinedSplitBubbles = splitBubbles,
                         m3Partitions = partitions
                     )
+                }
+
+                // Target: Module 4 (Dialogue Data Prepare & MangaOCR)
+                if (targetModule.id >= 5) {
+                    statusMessage = "[M4.1] Preparing dialogue groups (Bubbled + Orphans, excluding SFX)..."
+                    val groups = withContext(Dispatchers.Default) {
+                        DialogueGroupPreparer.prepareGroups(
+                            verticalLines = curr.m2VerticalLines.ifEmpty { curr.m1Lines },
+                            bubbleRegions = if (curr.m2ConjoinedSplitBubbles.isNotEmpty()) curr.m2ConjoinedSplitBubbles else curr.m1Bubbles,
+                            bubbleMasks = curr.detectedMasks,
+                            partitions = curr.m3Partitions,
+                            bitmapWidth = bmp.width,
+                            bitmapHeight = bmp.height,
+                            isRtl = true
+                        )
+                    }
+
+                    if (downloader.isMangaOcrReady()) {
+                        statusMessage = "[M4.2] Running MangaOCR on ${groups.size} dialogue groups..."
+                        val ocrRes = withContext(Dispatchers.Default) {
+                            mangaOcrEngine.executeDialogueOcr(
+                                bitmap = bmp,
+                                groups = groups,
+                                chunkLinesCount = 2
+                            ) { done, total, text ->
+                                statusMessage = "[M4.2] OCR ($done/$total): 「${text.take(12)}...」"
+                            }
+                        }
+                        curr = curr.copy(
+                            m4DialogueGroups = ocrRes.updatedGroups,
+                            m4OcrBlocks = ocrRes.blocks,
+                            m4OcrCrops = ocrRes.crops,
+                            m4OcrDurationMs = ocrRes.durationMs
+                        )
+                    } else {
+                        curr = curr.copy(
+                            m4DialogueGroups = groups,
+                            m4OcrBlocks = emptyList(),
+                            m4OcrCrops = emptyList(),
+                            m4OcrDurationMs = 0L
+                        )
+                    }
+                }
+
+                // Target: Module 5 (Translation: Google / ML Kit / Sugoi)
+                if (targetModule.id >= 6) {
+                    val inputGroups = curr.m4DialogueGroups
+                    if (inputGroups.isEmpty()) {
+                        statusMessage = "[M5] No dialogue groups found. Run Module 4 first!"
+                    } else {
+                        val translator: TextTranslator = when (selectedEngine) {
+                            TranslationEngineType.GOOGLE -> googleTranslator
+                            TranslationEngineType.MLKIT -> mlkitTranslator
+                            TranslationEngineType.SUGOI -> {
+                                sugoiTranslator.beamWidth = sugoiBeamWidth
+                                sugoiTranslator
+                            }
+                        }
+
+                        val engineLabel = when (selectedEngine) {
+                            TranslationEngineType.GOOGLE -> "Google Translate"
+                            TranslationEngineType.MLKIT -> "Google ML Kit"
+                            TranslationEngineType.SUGOI -> "Sugoi V4 ONNX (Beam $sugoiBeamWidth)"
+                        }
+
+                        statusMessage = "[M5] Translating ${inputGroups.size} groups with $engineLabel..."
+                        val startTime = System.currentTimeMillis()
+                        val textsToTranslate = inputGroups.map { it.recognizedText }
+
+                        val translatedTexts = withContext(Dispatchers.Default) {
+                            translator.translateBatch(textsToTranslate) { done, total ->
+                                statusMessage = "[M5] Translating ($done/$total) with $engineLabel..."
+                            }
+                        }
+                        val duration = System.currentTimeMillis() - startTime
+
+                        val translatedGroups = inputGroups.mapIndexed { idx, grp ->
+                            val tText = translatedTexts.getOrElse(idx) { "" }
+                            grp.copy(
+                                translatedText = tText,
+                                translationEngine = engineLabel
+                            )
+                        }
+
+                        curr = curr.copy(
+                            m5TranslatedGroups = translatedGroups,
+                            m5EngineType = engineLabel,
+                            m5DurationMs = duration
+                        )
+                    }
                 }
 
                 val updatedList = processedPages.toMutableList()
@@ -438,6 +586,18 @@ fun CrunchLabScreen() {
                         } else {
                             "$crunched conjoined ($totalCand candidates), ${curr.m3Partitions.size} total"
                         }
+                    }
+                    DebugModule.MODULE_4_OCR -> {
+                        val bGroups = curr.m4DialogueGroups.count { it.isBubble }
+                        val oGroups = curr.m4DialogueGroups.count { !it.isBubble }
+                        val totalLines = curr.m4DialogueGroups.sumOf { it.lines.size }
+                        val textCount = curr.m4DialogueGroups.count { it.recognizedText.isNotBlank() }
+                        "${curr.m4DialogueGroups.size} dialogue groups ($bGroups bubbled, $oGroups orphan, $totalLines lines, $textCount OCR-recognized, ${curr.m4OcrDurationMs}ms)"
+                    }
+                    DebugModule.MODULE_5_TRANSLATE -> {
+                        val total = curr.m5TranslatedGroups.size
+                        val doneCount = curr.m5TranslatedGroups.count { it.translatedText.isNotBlank() }
+                        "$total groups translated ($doneCount via ${curr.m5EngineType}, ${curr.m5DurationMs}ms)"
                     }
                 }
                 statusMessage = "✓ ${targetModule.shortName} complete! ($countMsg)"
@@ -471,6 +631,7 @@ fun CrunchLabScreen() {
             m1_5SubStep = M1_5SubStep.ALL
             m2SubStep = M2SubStep.ALL_LINES
             m3SubStep = M3SubStep.LOBE_PARTITION
+            m4SubStep = M4SubStep.DATA_PREPARE
             processedPages = items.mapIndexed { idx, (label, bmp) ->
                 ProcessedPage(
                     index = idx,
@@ -601,6 +762,280 @@ fun CrunchLabScreen() {
                         }
                     }
                 }
+            } else if (activeModule == DebugModule.MODULE_4_OCR && activePage?.m4DialogueGroups?.isNotEmpty() == true) {
+                Surface(
+                    color = Color(0xFF1B1B1B),
+                    tonalElevation = 4.dp,
+                    shadowElevation = 4.dp
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        val groupColors = listOf(
+                            Color(0xFF00E5FF),
+                            Color(0xFFFFD600),
+                            Color(0xFFFF4081),
+                            Color(0xFF76FF03),
+                            Color(0xFFFF9100),
+                            Color(0xFFE040FB),
+                            Color(0xFF00E676),
+                            Color(0xFF40C4FF),
+                        )
+
+                        if (m4SubStep == M4SubStep.OCR_OUTPUT && activePage.m4OcrCrops.isNotEmpty()) {
+                            // Crops Gallery Carousel
+                            LazyRow(
+                                state = bubbleListState,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth().height(68.dp)
+                            ) {
+                                itemsIndexed(activePage.m4OcrCrops) { _, item ->
+                                    val isSelected = spotlightRect == item.rect
+                                    val bg = if (isSelected) Color(0xFF0091EA) else Color(0xFF212121)
+
+                                    Surface(
+                                        color = bg,
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = if (isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, Color(0xFF00E5FF)) else androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF333333)),
+                                        modifier = Modifier
+                                            .fillMaxHeight()
+                                            .clickable {
+                                                spotlightRect = item.rect
+                                                val grp = activePage.m4DialogueGroups.firstOrNull { it.groupId == item.groupId }
+                                                inspectedBoxInfo = BoxInspectionInfo(
+                                                    badgeNumber = "#G${item.groupId}",
+                                                    title = if (item.isBubble) "Bubbled Dialogue Crop" else "Orphan Dialogue Crop",
+                                                    subtitle = "${item.rect.width()} × ${item.rect.height()} px",
+                                                    dimensions = "${item.rect.width()} × ${item.rect.height()} px",
+                                                    recognizedText = item.rawText.ifBlank { grp?.recognizedText },
+                                                    confidence = "MangaOCR Recognition",
+                                                    tagColor = if (item.isBubble) Color(0xFF00E676) else Color(0xFFFFD600),
+                                                    rect = item.rect
+                                                )
+                                            }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            if (item.cropBitmap != null && !item.cropBitmap.isRecycled) {
+                                                Image(
+                                                    bitmap = item.cropBitmap.asImageBitmap(),
+                                                    contentDescription = null,
+                                                    modifier = Modifier
+                                                        .size(56.dp)
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(Color.Black),
+                                                    contentScale = ContentScale.Fit
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                            }
+                                            Column(
+                                                modifier = Modifier.widthIn(max = 140.dp),
+                                                verticalArrangement = Arrangement.Center
+                                            ) {
+                                                Text(
+                                                    "#G${item.groupId} ${if (item.isBubble) "⚪" else "🏷️"}",
+                                                    color = Color.White,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                                if (item.rawText.isNotBlank()) {
+                                                    Text(
+                                                        "「${item.rawText.take(12)}」",
+                                                        color = Color(0xFF00E5FF),
+                                                        fontSize = 9.sp,
+                                                        fontWeight = FontWeight.Medium,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                }
+                                                Text(
+                                                    "${item.rect.width()}×${item.rect.height()}",
+                                                    color = Color.Gray,
+                                                    fontSize = 8.sp
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Dialogue Groups Carousel (Data Prepare)
+                            LazyRow(
+                                state = bubbleListState,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth().height(68.dp)
+                            ) {
+                                itemsIndexed(activePage.m4DialogueGroups) { _, item ->
+                                    val isSelected = spotlightRect == item.bounds
+                                    val grpColor = groupColors[(item.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                    val bg = if (isSelected) Color(0xFF0091EA) else Color(0xFF212121)
+
+                                    Surface(
+                                        color = bg,
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = if (isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, Color.White) else androidx.compose.foundation.BorderStroke(1.dp, grpColor.copy(alpha = 0.6f)),
+                                        modifier = Modifier
+                                            .fillMaxHeight()
+                                            .clickable {
+                                                spotlightRect = item.bounds
+                                                inspectedBoxInfo = BoxInspectionInfo(
+                                                    badgeNumber = "#G${item.groupId}",
+                                                    title = if (item.isBubble) "Bubbled Dialogue Unit" else "Orphan Dialogue Unit",
+                                                    subtitle = "${item.lines.size} vertical lines (${if (item.isBubble) "Bubble #${(item.bubbleIndex ?: 0) + 1}" else "Unbubbled"})",
+                                                    dimensions = "${item.bounds.width()} × ${item.bounds.height()} px",
+                                                    recognizedText = item.recognizedText.ifBlank { null },
+                                                    confidence = "Module 4.1 Dialogue Group",
+                                                    tagColor = grpColor,
+                                                    rect = item.bounds
+                                                )
+                                            }
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            verticalArrangement = Arrangement.Center
+                                        ) {
+                                            Text(
+                                                "#G${item.groupId} ${if (item.isBubble) "⚪" else "🏷️"}",
+                                                color = grpColor,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                "${item.lines.size} col${if (item.lines.size != 1) "s" else ""} (RTL)",
+                                                color = Color.LightGray,
+                                                fontSize = 9.sp
+                                            )
+                                            if (item.recognizedText.isNotBlank()) {
+                                                Text(
+                                                    "「${item.recognizedText.take(8)}...」",
+                                                    color = Color(0xFF00E5FF),
+                                                    fontSize = 8.sp,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            } else {
+                                                Text(
+                                                    "${item.bounds.width()}×${item.bounds.height()}",
+                                                    color = Color.Gray,
+                                                    fontSize = 8.sp
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (activeModule == DebugModule.MODULE_5_TRANSLATE && activePage?.m5TranslatedGroups?.isNotEmpty() == true) {
+                Surface(
+                    color = Color(0xFF1B1B1B),
+                    tonalElevation = 4.dp,
+                    shadowElevation = 4.dp
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        val groupColors = listOf(
+                            Color(0xFF00E5FF),
+                            Color(0xFFFFD600),
+                            Color(0xFFFF4081),
+                            Color(0xFF76FF03),
+                            Color(0xFFFF9100),
+                            Color(0xFFE040FB),
+                            Color(0xFF00E676),
+                            Color(0xFF40C4FF),
+                        )
+
+                        LazyRow(
+                            state = bubbleListState,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth().height(68.dp)
+                        ) {
+                            itemsIndexed(activePage.m5TranslatedGroups) { idx, item ->
+                                val isSelected = spotlightRect == item.bounds
+                                val grpColor = groupColors[idx % groupColors.size]
+                                val bg = if (isSelected) Color(0xFF0091EA) else Color(0xFF212121)
+
+                                Surface(
+                                    color = bg,
+                                    shape = RoundedCornerShape(6.dp),
+                                    border = if (isSelected) BorderStroke(1.5.dp, Color(0xFF00E5FF)) else BorderStroke(1.dp, grpColor.copy(alpha = 0.5f)),
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .clickable {
+                                            spotlightRect = item.bounds
+                                            inspectedBoxInfo = BoxInspectionInfo(
+                                                badgeNumber = "#G${item.groupId}",
+                                                title = if (item.isBubble) "Bubbled Dialogue" else "Orphan Dialogue",
+                                                subtitle = item.translationEngine.ifBlank { "Translated" },
+                                                dimensions = "${item.bounds.width()} × ${item.bounds.height()} px",
+                                                recognizedText = item.recognizedText.ifBlank { null },
+                                                translatedText = item.translatedText.ifBlank { null },
+                                                confidence = "Module 5 Translation",
+                                                tagColor = grpColor,
+                                                rect = item.bounds
+                                            )
+                                        }
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Text(
+                                                "#G${item.groupId} ${if (item.isBubble) "⚪" else "🏷️"}",
+                                                color = grpColor,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            if (item.translationEngine.isNotBlank()) {
+                                                Text(
+                                                    item.translationEngine.take(8),
+                                                    color = Color.Gray,
+                                                    fontSize = 8.sp
+                                                )
+                                            }
+                                        }
+                                        if (item.translatedText.isNotBlank()) {
+                                            Text(
+                                                "\"${item.translatedText}\"",
+                                                color = Color.White,
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                "JP: 「${item.recognizedText.take(8)}...」",
+                                                color = Color(0xFF80D8FF),
+                                                fontSize = 8.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        } else {
+                                            Text(
+                                                "「${item.recognizedText.take(12)}...」",
+                                                color = Color(0xFF00E5FF),
+                                                fontSize = 8.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         bottomBar = {
@@ -658,6 +1093,7 @@ fun CrunchLabScreen() {
                                         )
                                         Spacer(modifier = Modifier.width(4.dp))
                                         val statusBadge = when {
+                                            page.m4DialogueGroups.isNotEmpty() -> "📖 ${page.m4DialogueGroups.size}"
                                             page.m3Partitions.isNotEmpty() -> "✂️ $m3Crunched"
                                             page.m2VerticalLines.isNotEmpty() -> "📑 $m2Count"
                                             page.m1_5CategorizedBoxes.isNotEmpty() -> "🏷️ $m1_5Count"
@@ -782,6 +1218,99 @@ fun CrunchLabScreen() {
                                     }
                                 }
                             }
+                            DebugModule.MODULE_4_OCR -> {
+                                M4SubStep.entries.forEach { step ->
+                                    val isSel = m4SubStep == step
+                                    Surface(
+                                        color = if (isSel) Color(0xFF00E5FF) else Color(0xFF2A2A2A),
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = if (isSel) null else androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF444444)),
+                                        modifier = Modifier.clickable { m4SubStep = step }
+                                    ) {
+                                        Text(
+                                            step.label,
+                                            color = if (isSel) Color.Black else Color.LightGray,
+                                            fontSize = 10.sp,
+                                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+
+                                val groups = activePage?.m4DialogueGroups ?: emptyList()
+                                val bCount = groups.count { it.isBubble }
+                                val oCount = groups.count { !it.isBubble }
+                                val lCount = groups.sumOf { it.lines.size }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(start = 4.dp)
+                                ) {
+                                    Surface(color = Color(0xFF00E676), shape = RoundedCornerShape(4.dp)) {
+                                        Text("Bubbled ($bCount)", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                    }
+                                    Surface(color = Color(0xFFFFD600), shape = RoundedCornerShape(4.dp)) {
+                                        Text("Orphan ($oCount)", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                    }
+                                    Surface(color = Color(0xFF1E88E5), shape = RoundedCornerShape(4.dp)) {
+                                        Text("Lines ($lCount)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                    }
+                                }
+                            }
+                            DebugModule.MODULE_5_TRANSLATE -> {
+                                TranslationEngineType.entries.forEach { eng ->
+                                    val isSel = selectedEngine == eng
+                                    Surface(
+                                        color = if (isSel) Color(0xFF00E5FF) else Color(0xFF2A2A2A),
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = if (isSel) null else androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF444444)),
+                                        modifier = Modifier.clickable { selectedEngine = eng }
+                                    ) {
+                                        Text(
+                                            eng.badge,
+                                            color = if (isSel) Color.Black else Color.LightGray,
+                                            fontSize = 10.sp,
+                                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+
+                                if (selectedEngine == TranslationEngineType.SUGOI) {
+                                    val isBeam1 = sugoiBeamWidth <= 1
+                                    Surface(
+                                        color = if (isBeam1) Color(0xFF673AB7) else Color(0xFF2A2A2A),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.clickable { sugoiBeamWidth = 1 }
+                                    ) {
+                                        Text("Beam 1 (Fast)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
+                                    }
+                                    Surface(
+                                        color = if (!isBeam1) Color(0xFF673AB7) else Color(0xFF2A2A2A),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.clickable { sugoiBeamWidth = 3 }
+                                    ) {
+                                        Text("Beam 3 (Accurate)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
+                                    }
+                                }
+
+                                val tGroups = activePage?.m5TranslatedGroups ?: emptyList()
+                                val tCount = tGroups.count { it.translatedText.isNotBlank() }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(start = 4.dp)
+                                ) {
+                                    Surface(color = if (tCount > 0) Color(0xFF00E676) else Color(0xFF424242), shape = RoundedCornerShape(4.dp)) {
+                                        Text("Translated ($tCount/${tGroups.size})", color = if (tCount > 0) Color.Black else Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                    }
+                                    if ((activePage?.m5DurationMs ?: 0L) > 0L) {
+                                        Surface(color = Color(0xFF1E88E5), shape = RoundedCornerShape(4.dp)) {
+                                            Text("${activePage?.m5DurationMs}ms", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -853,7 +1382,7 @@ fun CrunchLabScreen() {
                             }
                         }
 
-                        // MODULE TABS (M1, M1.5, M2, M3) WITH EMBEDDED PLAY BUTTON
+                        // MODULE TABS (M1, M1.5, M2, M3, M4) WITH EMBEDDED PLAY BUTTON
                         DebugModule.entries.forEach { mod ->
                             val isSelected = activeModule == mod
                             val hasData = when (mod) {
@@ -861,6 +1390,8 @@ fun CrunchLabScreen() {
                                 DebugModule.MODULE_1_5_CATEGORIZE -> activePage?.m1_5CategorizedBoxes?.isNotEmpty() == true
                                 DebugModule.MODULE_2_LINES -> activePage?.m2VerticalLines?.isNotEmpty() == true
                                 DebugModule.MODULE_3_CRUNCH -> activePage?.m3Partitions?.isNotEmpty() == true
+                                DebugModule.MODULE_4_OCR -> activePage?.m4DialogueGroups?.isNotEmpty() == true
+                                DebugModule.MODULE_5_TRANSLATE -> activePage?.m5TranslatedGroups?.isNotEmpty() == true
                             }
                             val tabBg = when {
                                 isSelected -> Color(0xFF00E5FF)
@@ -1057,21 +1588,40 @@ fun CrunchLabScreen() {
                         }
 
                         // 📥 Models Status Button
+                        val ocrNeeded = activeModule == DebugModule.MODULE_4_OCR
+                        val sugoiNeeded = activeModule == DebugModule.MODULE_5_TRANSLATE && selectedEngine == TranslationEngineType.SUGOI
+                        val isTargetModelReady = when {
+                            ocrNeeded -> downloader.isMangaOcrReady()
+                            sugoiNeeded -> downloader.isSugoiReady()
+                            else -> isAllModelsReady
+                        }
                         Surface(
-                            color = if (isAllModelsReady) Color(0xFF1B5E20) else Color(0xFFB71C1C),
+                            color = if (isTargetModelReady) Color(0xFF1B5E20) else Color(0xFFB71C1C),
                             shape = RoundedCornerShape(6.dp),
                             modifier = Modifier.clickable {
                                 focusManager.clearFocus()
                                 keyboardController?.hide()
-                                if (!isAllModelsReady) {
-                                    downloader.startDownloadAll {
-                                        isAllModelsReady = downloader.isAllModelsReady()
+                                if (ocrNeeded) {
+                                    if (!downloader.isMangaOcrReady()) {
+                                        downloader.startDownloadMangaOcr {
+                                            isAllModelsReady = downloader.isAllModelsReady()
+                                        }
+                                    }
+                                } else if (!sugoiNeeded) {
+                                    if (!isAllModelsReady) {
+                                        downloader.startDownloadAll {
+                                            isAllModelsReady = downloader.isAllModelsReady()
+                                        }
                                     }
                                 }
                             }
                         ) {
                             Text(
-                                if (isAllModelsReady) "✓ Models OK" else "📥 Get Models",
+                                when {
+                                    ocrNeeded -> if (isTargetModelReady) "✓ MangaOCR OK" else "📥 Get MangaOCR"
+                                    sugoiNeeded -> if (isTargetModelReady) "✓ Sugoi ONNX OK" else "📥 Sugoi Missing"
+                                    else -> if (isAllModelsReady) "✓ Models OK" else "📥 Get Models"
+                                },
                                 color = Color.White,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
@@ -1192,6 +1742,123 @@ fun CrunchLabScreen() {
                                                 val by = bmpY.toInt()
 
                                                 when (activeModule) {
+                                                    DebugModule.MODULE_4_OCR -> {
+                                                        val groups = activePage?.m4DialogueGroups ?: emptyList()
+                                                        var hitGroup: DialogueGroupItem? = null
+                                                        var hitLine: DialogueLineItem? = null
+
+                                                        for (g in groups) {
+                                                            val lHit = g.lines.filter {
+                                                                val r = it.rect
+                                                                bx in (r.left - 8)..(r.right + 8) && by in (r.top - 8)..(r.bottom + 8)
+                                                            }.minByOrNull {
+                                                                val dx = it.rect.centerX() - bx
+                                                                val dy = it.rect.centerY() - by
+                                                                dx * dx + dy * dy
+                                                            }
+                                                            if (lHit != null) {
+                                                                hitGroup = g
+                                                                hitLine = lHit
+                                                                break
+                                                            }
+                                                        }
+
+                                                        if (hitGroup == null) {
+                                                            val candidates = groups.filter {
+                                                                val r = it.bounds
+                                                                bx in (r.left - 6)..(r.right + 6) && by in (r.top - 6)..(r.bottom + 6)
+                                                            }
+                                                            hitGroup = candidates.minByOrNull {
+                                                                val dx = it.bounds.centerX() - bx
+                                                                val dy = it.bounds.centerY() - by
+                                                                dx * dx + dy * dy
+                                                            }
+                                                        }
+
+                                                        if (hitGroup != null) {
+                                                            spotlightRect = hitLine?.rect ?: hitGroup.bounds
+                                                            val groupColors = listOf(
+                                                                Color(0xFF00E5FF),
+                                                                Color(0xFFFFD600),
+                                                                Color(0xFFFF4081),
+                                                                Color(0xFF76FF03),
+                                                                Color(0xFFFF9100),
+                                                                Color(0xFFE040FB),
+                                                                Color(0xFF00E676),
+                                                                Color(0xFF40C4FF),
+                                                            )
+                                                            val tagCol = groupColors[(hitGroup.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                                            val badge = if (hitLine != null) "#G${hitGroup.groupId}.${hitLine.readingOrder}" else "#G${hitGroup.groupId}"
+                                                            val sub = if (hitLine != null) {
+                                                                "Col ${hitLine.readingOrder}/${hitGroup.lines.size} in Group #${hitGroup.groupId} (${if (hitGroup.isBubble) "Bubble" else "Orphan"})"
+                                                            } else {
+                                                                "${hitGroup.lines.size} columns (${if (hitGroup.isBubble) "Bubble" else "Orphan"})"
+                                                            }
+
+                                                            inspectedBoxInfo = BoxInspectionInfo(
+                                                                badgeNumber = badge,
+                                                                title = if (hitGroup.isBubble) "Bubbled Dialogue Unit" else "Orphan Dialogue Unit",
+                                                                subtitle = sub,
+                                                                dimensions = "${(hitLine?.rect ?: hitGroup.bounds).width()} × ${(hitLine?.rect ?: hitGroup.bounds).height()} px",
+                                                                recognizedText = hitGroup.recognizedText.ifBlank { null },
+                                                                confidence = "Module 4 Dialogue Unit",
+                                                                tagColor = tagCol,
+                                                                rect = hitLine?.rect ?: hitGroup.bounds
+                                                            )
+
+                                                            val gIdx = groups.indexOf(hitGroup)
+                                                            if (gIdx >= 0) {
+                                                                scope.launch { bubbleListState.animateScrollToItem(gIdx) }
+                                                            }
+                                                        } else {
+                                                            spotlightRect = null
+                                                            inspectedBoxInfo = null
+                                                        }
+                                                    }
+                                                    DebugModule.MODULE_5_TRANSLATE -> {
+                                                        val groups = activePage?.m5TranslatedGroups ?: emptyList()
+                                                        val candidates = groups.filter {
+                                                            val r = it.bounds
+                                                            bx in (r.left - 8)..(r.right + 8) && by in (r.top - 8)..(r.bottom + 8)
+                                                        }
+                                                        val hitGroup = candidates.minByOrNull {
+                                                            val dx = it.bounds.centerX() - bx
+                                                            val dy = it.bounds.centerY() - by
+                                                            dx * dx + dy * dy
+                                                        }
+                                                        if (hitGroup != null) {
+                                                            spotlightRect = hitGroup.bounds
+                                                            val groupColors = listOf(
+                                                                Color(0xFF00E5FF),
+                                                                Color(0xFFFFD600),
+                                                                Color(0xFFFF4081),
+                                                                Color(0xFF76FF03),
+                                                                Color(0xFFFF9100),
+                                                                Color(0xFFE040FB),
+                                                                Color(0xFF00E676),
+                                                                Color(0xFF40C4FF),
+                                                            )
+                                                            val tagCol = groupColors[(hitGroup.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                                            inspectedBoxInfo = BoxInspectionInfo(
+                                                                badgeNumber = "#G${hitGroup.groupId}",
+                                                                title = if (hitGroup.isBubble) "Bubbled Translation" else "Orphan Translation",
+                                                                subtitle = hitGroup.translationEngine.ifBlank { "Translated" },
+                                                                dimensions = "${hitGroup.bounds.width()} × ${hitGroup.bounds.height()} px",
+                                                                recognizedText = hitGroup.recognizedText.ifBlank { null },
+                                                                translatedText = hitGroup.translatedText.ifBlank { null },
+                                                                confidence = "Module 5 Translation",
+                                                                tagColor = tagCol,
+                                                                rect = hitGroup.bounds
+                                                            )
+                                                            val gIdx = groups.indexOf(hitGroup)
+                                                            if (gIdx >= 0) {
+                                                                scope.launch { bubbleListState.animateScrollToItem(gIdx) }
+                                                            }
+                                                        } else {
+                                                            spotlightRect = null
+                                                            inspectedBoxInfo = null
+                                                        }
+                                                    }
                                                     DebugModule.MODULE_3_CRUNCH -> {
                                                         val partitions = activePage?.m3Partitions ?: emptyList()
                                                         val hitIdx = partitions.indices.firstOrNull { idx ->
@@ -1453,7 +2120,7 @@ fun CrunchLabScreen() {
                             // Draw Base Manga Image
                             val baseImageToDraw = displayBmp
 
-                            if (baseImageToDraw != null && !baseImageToDraw.isRecycled) {
+                            if (!baseImageToDraw.isRecycled) {
                                 drawImage(
                                     image = baseImageToDraw.asImageBitmap(),
                                     dstOffset = IntOffset(drawLeft.toInt(), drawTop.toInt()),
@@ -1737,7 +2404,7 @@ fun CrunchLabScreen() {
 
                                                 // Draw lobe partitions
                                                 if (m3SubStep == M3SubStep.LOBE_PARTITION) {
-                                                    val baseLines = activePage?.m2VerticalLines?.ifEmpty { activePage?.m1Lines } ?: activePage?.m1Lines ?: emptyList()
+                                                    val baseLines = activePage?.let { p -> p.m2VerticalLines.ifEmpty { p.m1Lines } } ?: emptyList()
                                                     val linesMap = baseLines.associateBy { it.id }.toMutableMap()
                                                     item.splitLines.forEach { sl -> linesMap[sl.id] = sl }
                                                     val splitIds = item.splitLines.map { it.id }.toSet()
@@ -1788,6 +2455,333 @@ fun CrunchLabScreen() {
                                                             )
                                                         )
                                                     }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ══════════════════ MODULE 4 (DIALOGUE GROUPING & MANGA OCR) ══════════════════
+                                    DebugModule.MODULE_4_OCR -> {
+                                        val groups = activePage?.m4DialogueGroups ?: emptyList()
+                                        val groupColors = listOf(
+                                            Color(0xFF00E5FF), // Cyan
+                                            Color(0xFFFFD600), // Yellow
+                                            Color(0xFFFF4081), // Pink
+                                            Color(0xFF76FF03), // Lime
+                                            Color(0xFFFF9100), // Orange
+                                            Color(0xFFE040FB), // Purple
+                                            Color(0xFF00E676), // Green
+                                            Color(0xFF40C4FF), // Light Blue
+                                        )
+
+                                        when (m4SubStep) {
+                                            M4SubStep.DATA_PREPARE -> {
+                                                // Step 4.1: Data Prepare
+                                                // 1. Colorize actual bubble borders matching group color palette
+                                                groups.forEachIndexed { idx, group ->
+                                                    val grpColor = groupColors[idx % groupColors.size]
+
+                                                    if (group.isBubble) {
+                                                        if (group.contourPoints.isNotEmpty()) {
+                                                            // Draw actual Moore-Neighbor bubble contour polygon
+                                                            val path = Path()
+                                                            val first = toCanvasPoint(group.contourPoints.first())
+                                                            path.moveTo(first.x, first.y)
+                                                            for (i in 1 until group.contourPoints.size) {
+                                                                val cp = toCanvasPoint(group.contourPoints[i])
+                                                                path.lineTo(cp.x, cp.y)
+                                                            }
+                                                            path.close()
+
+                                                            // Translucent tint inside bubble contour
+                                                            drawPath(path = path, color = grpColor.copy(alpha = 0.08f))
+                                                            // Solid outline along actual bubble boundary
+                                                            drawPath(path = path, color = grpColor, style = Stroke(width = 2.4f))
+                                                        } else {
+                                                            // Fallback: draw rounded rectangle if contour points missing
+                                                            val cRect = toCanvasRect(group.bounds)
+                                                            drawRoundRect(
+                                                                color = grpColor,
+                                                                topLeft = Offset(cRect.left, cRect.top),
+                                                                size = Size(cRect.width, cRect.height),
+                                                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(14f, 14f),
+                                                                style = Stroke(width = 2.4f)
+                                                            )
+                                                            drawRoundRect(
+                                                                color = grpColor.copy(alpha = 0.08f),
+                                                                topLeft = Offset(cRect.left, cRect.top),
+                                                                size = Size(cRect.width, cRect.height),
+                                                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(14f, 14f)
+                                                            )
+                                                        }
+                                                    } else {
+                                                        // Orphan group: dashed rounded bounding box
+                                                        val cRect = toCanvasRect(group.bounds)
+                                                        drawRoundRect(
+                                                            color = grpColor,
+                                                            topLeft = Offset(cRect.left, cRect.top),
+                                                            size = Size(cRect.width, cRect.height),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f),
+                                                            style = Stroke(width = 2.0f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f)))
+                                                        )
+                                                        drawRoundRect(
+                                                            color = grpColor.copy(alpha = 0.06f),
+                                                            topLeft = Offset(cRect.left, cRect.top),
+                                                            size = Size(cRect.width, cRect.height),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f)
+                                                        )
+                                                    }
+
+                                                    // 2. Draw Group Bounding Box Header (#G[ID] [B/O])
+                                                    val cBounds = toCanvasRect(group.bounds)
+                                                    drawContext.canvas.nativeCanvas.apply {
+                                                        val headerText = "#G${group.groupId} ${if (group.isBubble) "B" else "O"}"
+                                                        val hPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                            this.color = android.graphics.Color.WHITE
+                                                            textSize = 13f
+                                                            typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                        }
+                                                        val hW = hPaint.measureText(headerText)
+                                                        val pillH = 17f
+                                                        val pillW = hW + 8f
+                                                        val bLeft = cBounds.right - pillW // RTL header on top-right
+                                                        val bTop = (cBounds.top - pillH - 2f).coerceAtLeast(drawTop)
+
+                                                        val bgP = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                            this.color = grpColor.toArgb()
+                                                            style = android.graphics.Paint.Style.FILL
+                                                        }
+                                                        val rF = android.graphics.RectF(bLeft, bTop, bLeft + pillW, bTop + pillH)
+                                                        drawRoundRect(rF, 4f, 4f, bgP)
+                                                        val textY = bTop + pillH / 2f - (hPaint.descent() + hPaint.ascent()) / 2f
+                                                        drawText(headerText, bLeft + 4f, textY, hPaint)
+                                                    }
+
+                                                    // 3. Draw vertical line strips with Japanese RTL numbering badges (#G[ID].[col])
+                                                    group.lines.forEach { line ->
+                                                        val lr = toCanvasRect(line.rect)
+                                                        drawRect(
+                                                            color = grpColor,
+                                                            topLeft = Offset(lr.left, lr.top),
+                                                            size = Size(lr.width, lr.height),
+                                                            style = Stroke(width = 1.8f)
+                                                        )
+                                                        drawRect(
+                                                            color = grpColor.copy(alpha = 0.12f),
+                                                            topLeft = Offset(lr.left, lr.top),
+                                                            size = Size(lr.width, lr.height)
+                                                        )
+
+                                                        // Draw RTL sequence badge
+                                                        drawContext.canvas.nativeCanvas.apply {
+                                                            val badgeText = "#G${group.groupId}.${line.readingOrder}"
+                                                            val tPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = android.graphics.Color.BLACK
+                                                                textSize = 11f
+                                                                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                            }
+                                                            val tW = tPaint.measureText(badgeText)
+                                                            val bH = 15f
+                                                            val bW = tW + 6f
+                                                            val badgeLeft = lr.left
+                                                            val badgeTop = (lr.top - bH).coerceAtLeast(drawTop)
+
+                                                            val badgeBg = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = android.graphics.Color.WHITE
+                                                                style = android.graphics.Paint.Style.FILL
+                                                            }
+                                                            val rF = android.graphics.RectF(badgeLeft, badgeTop, badgeLeft + bW, badgeTop + bH)
+                                                            drawRoundRect(rF, 3f, 3f, badgeBg)
+                                                            val textY = badgeTop + bH / 2f - (tPaint.descent() + tPaint.ascent()) / 2f
+                                                            drawText(badgeText, badgeLeft + 3f, textY, tPaint)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            M4SubStep.OCR_OUTPUT -> {
+                                                // Step 4.2: MangaOCR Text Recognition Output
+                                                groups.forEachIndexed { idx, group ->
+                                                    val grpColor = groupColors[idx % groupColors.size]
+                                                    val cBounds = toCanvasRect(group.bounds)
+
+                                                    // Draw bounding box
+                                                    drawRoundRect(
+                                                        color = grpColor,
+                                                        topLeft = Offset(cBounds.left, cBounds.top),
+                                                        size = Size(cBounds.width, cBounds.height),
+                                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f),
+                                                        style = Stroke(width = 2.2f)
+                                                    )
+
+                                                    // Draw dark pill card with recognized Japanese text 「...」
+                                                    if (group.recognizedText.isNotBlank()) {
+                                                        drawContext.canvas.nativeCanvas.apply {
+                                                            val textStr = "「${group.recognizedText}」"
+                                                            val ocrPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = android.graphics.Color.WHITE
+                                                                textSize = 15f
+                                                                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                            }
+                                                            val textWidth = ocrPaint.measureText(textStr)
+                                                            val cardPadding = 8f
+                                                            val cardW = textWidth + cardPadding * 2
+                                                            val cardH = 24f
+                                                            val cardLeft = cBounds.left
+                                                            val cardTop = (cBounds.bottom + 4f).coerceAtMost(drawTop + drawH - cardH)
+
+                                                            val cardBgPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = android.graphics.Color.argb(220, 20, 20, 20)
+                                                                style = android.graphics.Paint.Style.FILL
+                                                            }
+                                                            val cardBorderPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = grpColor.toArgb()
+                                                                style = android.graphics.Paint.Style.STROKE
+                                                                strokeWidth = 1.5f
+                                                            }
+
+                                                            val rectF = android.graphics.RectF(cardLeft, cardTop, cardLeft + cardW, cardTop + cardH)
+                                                            drawRoundRect(rectF, 6f, 6f, cardBgPaint)
+                                                            drawRoundRect(rectF, 6f, 6f, cardBorderPaint)
+
+                                                            val textY = cardTop + cardH / 2f - (ocrPaint.descent() + ocrPaint.ascent()) / 2f
+                                                            drawText(textStr, cardLeft + cardPadding, textY, ocrPaint)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ══════════════════ MODULE 5 (TRANSLATION) ══════════════════
+                                    DebugModule.MODULE_5_TRANSLATE -> {
+                                        val groups = activePage?.m5TranslatedGroups ?: emptyList()
+                                        val groupColors = listOf(
+                                            Color(0xFF00E5FF),
+                                            Color(0xFFFFD600),
+                                            Color(0xFFFF4081),
+                                            Color(0xFF76FF03),
+                                            Color(0xFFFF9100),
+                                            Color(0xFFE040FB),
+                                            Color(0xFF00E676),
+                                            Color(0xFF40C4FF),
+                                        )
+
+                                        groups.forEachIndexed { idx, group ->
+                                            val grpColor = groupColors[idx % groupColors.size]
+
+                                            // Draw bubble contour if available, else bounding box
+                                            if (group.isBubble && group.contourPoints.isNotEmpty()) {
+                                                val path = Path()
+                                                val first = toCanvasPoint(group.contourPoints.first())
+                                                path.moveTo(first.x, first.y)
+                                                for (i in 1 until group.contourPoints.size) {
+                                                    val cp = toCanvasPoint(group.contourPoints[i])
+                                                    path.lineTo(cp.x, cp.y)
+                                                }
+                                                path.close()
+                                                drawPath(path = path, color = grpColor.copy(alpha = 0.08f))
+                                                drawPath(path = path, color = grpColor, style = Stroke(width = 2.4f))
+                                            } else {
+                                                val cBounds = toCanvasRect(group.bounds)
+                                                drawRoundRect(
+                                                    color = grpColor,
+                                                    topLeft = Offset(cBounds.left, cBounds.top),
+                                                    size = Size(cBounds.width, cBounds.height),
+                                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f),
+                                                    style = Stroke(width = 2.2f)
+                                                )
+                                                drawRoundRect(
+                                                    color = grpColor.copy(alpha = 0.08f),
+                                                    topLeft = Offset(cBounds.left, cBounds.top),
+                                                    size = Size(cBounds.width, cBounds.height),
+                                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f)
+                                                )
+                                            }
+
+                                            // Draw English Translation Card Overlay
+                                            val cBounds = toCanvasRect(group.bounds)
+                                            drawContext.canvas.nativeCanvas.apply {
+                                                val en = group.translatedText.ifBlank { "(no translation)" }
+                                                val jp = group.recognizedText.ifBlank { "" }
+
+                                                val enPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    this.color = android.graphics.Color.WHITE
+                                                    textSize = 14f
+                                                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                }
+                                                val jpPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    this.color = android.graphics.Color.rgb(180, 210, 240)
+                                                    textSize = 11f
+                                                }
+                                                val hdrPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    this.color = grpColor.toArgb()
+                                                    textSize = 10f
+                                                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                }
+
+                                                val cardWidth = 200f.coerceAtLeast(cBounds.width.coerceAtMost(300f))
+                                                val pad = 8f
+                                                val maxTextW = cardWidth - pad * 2
+
+                                                // Word wrap
+                                                val wrappedEnLines = mutableListOf<String>()
+                                                val words = en.split(" ")
+                                                var curLine = StringBuilder()
+                                                for (w in words) {
+                                                    val candidate = if (curLine.isEmpty()) w else "$curLine $w"
+                                                    if (enPaint.measureText(candidate) <= maxTextW) {
+                                                        curLine = StringBuilder(candidate)
+                                                    } else {
+                                                        if (curLine.isNotEmpty()) wrappedEnLines.add(curLine.toString())
+                                                        curLine = StringBuilder(w)
+                                                    }
+                                                }
+                                                if (curLine.isNotEmpty()) wrappedEnLines.add(curLine.toString())
+
+                                                val cardHeight = 16f + (if (jp.isNotBlank()) 14f else 0f) + (wrappedEnLines.size * 18f) + 10f
+                                                var cardLeft = cBounds.left
+                                                if (cardLeft + cardWidth > drawLeft + drawW) {
+                                                    cardLeft = (drawLeft + drawW - cardWidth - 4f).coerceAtLeast(drawLeft)
+                                                }
+                                                var cardTop = cBounds.bottom + 4f
+                                                if (cardTop + cardHeight > drawTop + drawH) {
+                                                    cardTop = (cBounds.top - cardHeight - 4f).coerceAtLeast(drawTop)
+                                                }
+
+                                                val cardBgPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    this.color = android.graphics.Color.argb(230, 24, 24, 30)
+                                                    style = android.graphics.Paint.Style.FILL
+                                                }
+                                                val cardBorderPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    this.color = grpColor.toArgb()
+                                                    style = android.graphics.Paint.Style.STROKE
+                                                    strokeWidth = 1.5f
+                                                }
+
+                                                val cardRectF = android.graphics.RectF(cardLeft, cardTop, cardLeft + cardWidth, cardTop + cardHeight)
+                                                drawRoundRect(cardRectF, 6f, 6f, cardBgPaint)
+                                                drawRoundRect(cardRectF, 6f, 6f, cardBorderPaint)
+
+                                                var lineY = cardTop + 14f
+                                                val headerTag = "#G${group.groupId} ${if (group.isBubble) "BUBBLE" else "ORPHAN"}"
+                                                drawText(headerTag, cardLeft + pad, lineY, hdrPaint)
+                                                lineY += 14f
+
+                                                if (jp.isNotBlank()) {
+                                                    var jpShort = "JP: $jp"
+                                                    if (jpPaint.measureText(jpShort) > maxTextW) {
+                                                        while (jpShort.length > 5 && jpPaint.measureText("$jpShort...") > maxTextW) {
+                                                            jpShort = jpShort.substring(0, jpShort.length - 1)
+                                                        }
+                                                        jpShort = "$jpShort..."
+                                                    }
+                                                    drawText(jpShort, cardLeft + pad, lineY, jpPaint)
+                                                    lineY += 16f
+                                                }
+
+                                                for (line in wrappedEnLines) {
+                                                    drawText(line, cardLeft + pad, lineY, enPaint)
+                                                    lineY += 18f
                                                 }
                                             }
                                         }
@@ -1921,6 +2915,22 @@ fun CrunchLabScreen() {
                                             )
                                         }
                                     }
+                                    if (!info.translatedText.isNullOrBlank()) {
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Surface(
+                                            color = Color(0xFF1E2838),
+                                            shape = RoundedCornerShape(6.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text(
+                                                text = info.translatedText,
+                                                color = Color(0xFF69F0AE),
+                                                fontSize = 13.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1961,7 +2971,7 @@ fun CrunchLabScreen() {
             text = {
                 Column {
                     Text(
-                        "Saves intermediate state of Modules 1, 2, and 3 so they can be loaded instantly without re-running models.",
+                        "Saves intermediate state of Modules 1, 2, 3, and 4 so they can be loaded instantly without re-running models.",
                         fontSize = 11.sp,
                         color = Color.Gray
                     )
@@ -1978,6 +2988,8 @@ fun CrunchLabScreen() {
                     Text("• Module 1.5: ${activePage.m1_5CategorizedBoxes.size} categorized", fontSize = 10.sp)
                     Text("• Module 2: ${activePage.m2VerticalLines.size} vertical lines", fontSize = 10.sp)
                     Text("• Module 3: ${activePage.m3Partitions.size} bubble partitions", fontSize = 10.sp)
+                    Text("• Module 4: ${activePage.m4DialogueGroups.size} dialogue groups", fontSize = 10.sp)
+                    Text("• Module 5: ${activePage.m5TranslatedGroups.size} translated groups", fontSize = 10.sp)
                 }
             },
             confirmButton = {
@@ -1992,7 +3004,10 @@ fun CrunchLabScreen() {
                         module1_5CategorizedBoxes = activePage.m1_5CategorizedBoxes,
                         module2VerticalLines = activePage.m2VerticalLines,
                         module2ConjoinedSplitBubbles = activePage.m2ConjoinedSplitBubbles,
-                        module3Partitions = activePage.m3Partitions
+                        module3Partitions = activePage.m3Partitions,
+                        module4DialogueGroups = activePage.m4DialogueGroups,
+                        module5DialogueGroups = activePage.m5TranslatedGroups,
+                        module5EngineType = activePage.m5EngineType
                     )
                     snapshotManager.saveSnapshot(activePage.label, snap)
                     statusMessage = "💾 Snapshot '$slot' saved successfully!"
@@ -2034,7 +3049,7 @@ fun CrunchLabScreen() {
                                         Text(file.nameWithoutExtension, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Color.White)
                                         if (snap != null) {
                                             Text(
-                                                "M1: ${snap.module1Lines.size}L · M1.5: ${snap.module1_5CategorizedBoxes.size}C · M2: ${snap.module2VerticalLines.size}V · M3: ${snap.module3Partitions.size}P",
+                                                "M1: ${snap.module1Lines.size}L · M1.5: ${snap.module1_5CategorizedBoxes.size}C · M2: ${snap.module2VerticalLines.size}V · M3: ${snap.module3Partitions.size}P · M4: ${snap.module4DialogueGroups.size}G · M5: ${snap.module5DialogueGroups.size}T",
                                                 fontSize = 9.sp,
                                                 color = Color(0xFF00E5FF)
                                             )
@@ -2049,7 +3064,10 @@ fun CrunchLabScreen() {
                                                 m1_5CategorizedBoxes = snap.module1_5CategorizedBoxes,
                                                 m2VerticalLines = snap.module2VerticalLines,
                                                 m2ConjoinedSplitBubbles = snap.module2ConjoinedSplitBubbles,
-                                                m3Partitions = snap.module3Partitions
+                                                m3Partitions = snap.module3Partitions,
+                                                m4DialogueGroups = snap.module4DialogueGroups,
+                                                m5TranslatedGroups = snap.module5DialogueGroups,
+                                                m5EngineType = snap.module5EngineType
                                             )
                                             val list = processedPages.toMutableList()
                                             list[activePageIndex] = updated
