@@ -37,40 +37,29 @@ class VerticalLineStitcher:
 
     @staticmethod
     def is_box_blank(image_bgr: np.ndarray, rect: Rect) -> bool:
-        h_img, w_img = image_bgr.shape[:2]
-        cl_l = max(0, min(w_img - 1, rect.left))
-        cl_t = max(0, min(h_img - 1, rect.top))
-        cl_r = max(cl_l + 1, min(w_img, rect.right))
-        cl_b = max(cl_t + 1, min(h_img, rect.bottom))
-        w = cl_r - cl_l
-        h = cl_b - cl_t
-        if w <= 0 or h <= 0 or (w < 4 and h < 4):
-            return True
-
-        patch = image_bgr[cl_t:cl_b, cl_l:cl_r]
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        total_pixels = w * h
-
-        min_l = int(np.min(gray))
-        max_l = int(np.max(gray))
-        contrast = max_l - min_l
-        if contrast < 18:
-            return True
-
-        mean_l = float(np.mean(gray))
-        dark_count = int(np.sum(gray < 135))
-        bright_count = int(np.sum(gray > 200))
-        dark_ratio = dark_count / float(total_pixels)
-        bright_ratio = bright_count / float(total_pixels)
-
-        if mean_l > 185 and (dark_ratio < 0.008 or dark_count < 4):
-            return True
-        if mean_l < 70 and (bright_ratio < 0.008 or bright_count < 4):
-            return True
-        if contrast < 18 and dark_ratio < 0.01:
-            return True
-
+        # Zero-Drop Conservation Engine: ink detection by CTD network is trusted unconditionally.
         return False
+
+    @staticmethod
+    def find_matching_mask(bubble: Rect, bubble_masks: List[BubbleMask]) -> Optional[BubbleMask]:
+        if not bubble_masks:
+            return None
+        for bm in bubble_masks:
+            if bm.rect == bubble:
+                return bm
+        max_inter = 0
+        best_mask = None
+        for bm in bubble_masks:
+            il = max(bm.rect.left, bubble.left)
+            it = max(bm.rect.top, bubble.top)
+            ir = min(bm.rect.right, bubble.right)
+            ib = min(bm.rect.bottom, bubble.bottom)
+            if ir > il and ib > it:
+                inter = (ir - il) * (ib - it)
+                if inter > max_inter:
+                    max_inter = inter
+                    best_mask = bm
+        return best_mask
 
     @staticmethod
     def stitch_lines(
@@ -88,12 +77,8 @@ class VerticalLineStitcher:
         if not categorized_boxes:
             return [], [], [], [], 0
 
-        # Pre-filter blank boxes
-        if image_bgr is not None:
-            valid_categorized = [b for b in categorized_boxes if not VerticalLineStitcher.is_box_blank(image_bgr, b.rect)]
-        else:
-            valid_categorized = list(categorized_boxes)
-
+        # Zero-Drop Conservation Engine: Preserve 100% of detected CTD boxes
+        valid_categorized = list(categorized_boxes)
         if not valid_categorized:
             return [], [], [], [], 0
 
@@ -133,19 +118,29 @@ class VerticalLineStitcher:
                     in_envelope = (bubble.left - 6 <= cx <= bubble.right + 6) and (bubble.top - 6 <= cy <= bubble.bottom + 6)
 
                     match = False
-                    if item.category == "BUBBLED":
-                        if bubble.contains(cx, cy) or (in_envelope and (ratio >= 0.35 or inter_area > 0)):
+                    matching_mask = VerticalLineStitcher.find_matching_mask(bubble, bubble_masks)
+                    if matching_mask is not None:
+                        mil = max(matching_mask.rect.left, box.left)
+                        mit = max(matching_mask.rect.top, box.top)
+                        mir = min(matching_mask.rect.right, box.right)
+                        mib = min(matching_mask.rect.bottom, box.bottom)
+                        mask_ratio = 0.0
+                        if mir > mil and mib > mit:
+                            sub_m = matching_mask.mask[mit - matching_mask.rect.top:mib - matching_mask.rect.top,
+                                                       mil - matching_mask.rect.left:mir - matching_mask.rect.left]
+                            mask_ratio = np.sum(sub_m) / float(box_area) if box_area > 0 else 0.0
+                        lx = cx - matching_mask.rect.left
+                        ly = cy - matching_mask.rect.top
+                        in_mask = (0 <= lx < matching_mask.width and 0 <= ly < matching_mask.height and bool(matching_mask.mask[ly, lx]))
+                        if in_mask and in_envelope and (mask_ratio >= 0.45 or (item.category == "BUBBLED" and mask_ratio >= 0.35)):
                             match = True
                     else:
-                        matching_mask = next((bm for bm in bubble_masks if bm.rect.contains(cx, cy)), None)
-                        in_mask = True
-                        if matching_mask is not None:
-                            lx = cx - matching_mask.rect.left
-                            ly = cy - matching_mask.rect.top
-                            if 0 <= lx < matching_mask.width and 0 <= ly < matching_mask.height:
-                                in_mask = bool(matching_mask.mask[ly, lx])
-                        if in_mask and is_truly_in and in_envelope:
-                            match = True
+                        if item.category == "BUBBLED":
+                            if bubble.contains(cx, cy) or (in_envelope and (ratio >= 0.35 or inter_area > 0)):
+                                match = True
+                        else:
+                            if is_truly_in and in_envelope:
+                                match = True
 
                     if match and inter_area > max_inter_area:
                         max_inter_area = inter_area
@@ -158,9 +153,11 @@ class VerticalLineStitcher:
         for b_idx, indices in enumerate(bubble_assignments):
             if not indices:
                 continue
+            b_target = distinct_bubbles[b_idx]
+            matching_mask = VerticalLineStitcher.find_matching_mask(b_target, bubble_masks)
             raw_cluster = [valid_categorized[idx].rect for idx in indices]
             stitched, furi_count = VerticalLineStitcher.stitch_bubble_columns(
-                raw_cluster, distinct_bubbles[b_idx], median_char_w, image_bgr
+                raw_cluster, b_target, median_char_w, image_bgr, matching_mask=matching_mask
             )
             result_bubbled.extend(stitched)
             total_furigana += furi_count
@@ -179,16 +176,16 @@ class VerticalLineStitcher:
         orphan_items = [TextLineItem(id=0, rect=r, category="ORPHAN") for r in final_orphan]
         sfx_items = [TextLineItem(id=0, rect=r, category="SFX") for r in final_sfx]
 
-        # 3. Suppress unbubbled items with major bubble overlap (>= 50%)
+        # 3. Suppress unbubbled items that significantly overlap an existing bubbled line (>= 50%)
         contained_lines = list(bubbled_items)
         for item in (orphan_items + sfx_items):
             r = item.rect.copy()
             valid = True
-            for b in distinct_bubbles:
-                inter_l = max(r.left, b.left)
-                inter_t = max(r.top, b.top)
-                inter_r = min(r.right, b.right)
-                inter_b = min(r.bottom, b.bottom)
+            for bl in bubbled_items:
+                inter_l = max(r.left, bl.rect.left)
+                inter_t = max(r.top, bl.rect.top)
+                inter_r = min(r.right, bl.rect.right)
+                inter_b = min(r.bottom, bl.rect.bottom)
                 if inter_r > inter_l and inter_b > inter_t:
                     inter_area = (inter_r - inter_l) * (inter_b - inter_t)
                     r_area = r.width() * r.height()
@@ -200,6 +197,128 @@ class VerticalLineStitcher:
 
         # 4. Cross-category deduplication
         deduplicated = VerticalLineStitcher._deduplicate_lines(contained_lines)
+
+        # 4b. Catch-Net Reconciler: Zero-Drop Conservation Engine
+        # Guarantees that every detected character box is preserved and accounted for in the output lines.
+        def _is_box_covered(b: Rect, lines: List[TextLineItem]) -> bool:
+            bcx = b.centerX()
+            bcy = b.centerY()
+            b_area = b.width() * b.height()
+            for l in lines:
+                if l.rect.contains(bcx, bcy):
+                    return True
+                il = max(l.rect.left, b.left)
+                it = max(l.rect.top, b.top)
+                ir = min(l.rect.right, b.right)
+                ib = min(l.rect.bottom, b.bottom)
+                if ir > il and ib > it:
+                    inter_a = (ir - il) * (ib - it)
+                    if b_area > 0 and (inter_a / float(b_area)) >= 0.35:
+                        return True
+            return False
+
+        for item in categorized_boxes:
+            b = item.rect
+            if not _is_box_covered(b, deduplicated):
+                bcx = b.centerX()
+                bcy = b.centerY()
+                best_b = None
+                max_inter = 0
+                for bubble in distinct_bubbles:
+                    il = max(b.left, bubble.left)
+                    it = max(b.top, bubble.top)
+                    ir = min(b.right, bubble.right)
+                    ib = min(b.bottom, bubble.bottom)
+                    if ir > il and ib > it:
+                        inter_a = (ir - il) * (ib - it)
+                        if inter_a > max_inter:
+                            max_inter = inter_a
+                            best_b = bubble
+
+                is_in_bubble = False
+                if best_b is not None and (max_inter > 0 or best_b.contains(bcx, bcy)):
+                    matching_mask = VerticalLineStitcher.find_matching_mask(best_b, bubble_masks)
+                    if matching_mask is not None:
+                        mil = max(matching_mask.rect.left, b.left)
+                        mit = max(matching_mask.rect.top, b.top)
+                        mir = min(matching_mask.rect.right, b.right)
+                        mib = min(matching_mask.rect.bottom, b.bottom)
+                        mask_ratio = 0.0
+                        if mir > mil and mib > mit:
+                            sub_m = matching_mask.mask[mit - matching_mask.rect.top:mib - matching_mask.rect.top,
+                                                       mil - matching_mask.rect.left:mir - matching_mask.rect.left]
+                            b_area = b.width() * b.height()
+                            mask_ratio = np.sum(sub_m) / float(b_area) if b_area > 0 else 0.0
+                        lx = bcx - matching_mask.rect.left
+                        ly = bcy - matching_mask.rect.top
+                        in_px = (0 <= lx < matching_mask.width and 0 <= ly < matching_mask.height and bool(matching_mask.mask[ly, lx]))
+                        is_in_bubble = in_px and mask_ratio >= 0.35
+                    else:
+                        is_in_bubble = True
+
+                if is_in_bubble and best_b is not None:
+                    # Box belongs to speech bubble best_b
+                    lines_in_b = [l for l in deduplicated if l.category == "BUBBLED" and
+                                  (best_b.contains(l.rect.centerX(), l.rect.centerY()) or
+                                   (max(best_b.left, l.rect.left) < min(best_b.right, l.rect.right) and
+                                    max(best_b.top, l.rect.top) < min(best_b.bottom, l.rect.bottom)))]
+                    corridor_line = next((l for l in lines_in_b if abs(l.rect.centerX() - bcx) <= median_char_w * 0.75), None)
+                    if corridor_line is not None:
+                        corridor_line.rect.left = min(corridor_line.rect.left, b.left)
+                        corridor_line.rect.right = max(corridor_line.rect.right, b.right)
+                        corridor_line.rect.top = min(corridor_line.rect.top, b.top)
+                        corridor_line.rect.bottom = max(corridor_line.rect.bottom, b.bottom)
+                    else:
+                        half_w = int(median_char_w * 0.54)
+                        cl_l = max(best_b.left, min(bcx - half_w, b.left))
+                        cl_r = min(best_b.right, max(bcx + half_w, b.right))
+                        cl_t = max(best_b.top, b.top)
+                        cl_b = min(best_b.bottom, b.bottom)
+                        deduplicated.append(TextLineItem(id=0, rect=Rect(cl_l, cl_t, cl_r, cl_b), category="BUBBLED"))
+                else:
+                    # Outside speech bubbles (open-art)
+                    unbubbled_lines = [l for l in deduplicated if l.category in ("ORPHAN", "SFX")]
+                    can_absorb = False
+                    for ul in unbubbled_lines:
+                        dx = abs(ul.rect.centerX() - bcx)
+                        dy = max(0, max(ul.rect.top - b.bottom, b.top - ul.rect.bottom))
+                        if dx <= median_char_w * 0.8 and dy <= median_char_w * 2.0:
+                            ul.rect.left = min(ul.rect.left, b.left)
+                            ul.rect.right = max(ul.rect.right, b.right)
+                            ul.rect.top = min(ul.rect.top, b.top)
+                            ul.rect.bottom = max(ul.rect.bottom, b.bottom)
+                            can_absorb = True
+                            break
+                    if not can_absorb:
+                        cat = item.category if item.category in ("ORPHAN", "SFX") else "ORPHAN"
+                        deduplicated.append(TextLineItem(id=0, rect=b.copy(), category=cat))
+
+        # Enforce non-collapsible bubble bound: for every bubble containing CTD ink, ensure at least 1 line exists
+        for bubble in distinct_bubbles:
+            boxes_in_b = [it for it in categorized_boxes if bubble.contains(it.rect.centerX(), it.rect.centerY()) or
+                          (max(bubble.left, it.rect.left) < min(bubble.right, it.rect.right) and
+                           max(bubble.top, it.rect.top) < min(bubble.bottom, it.rect.bottom) and
+                           (min(bubble.right, it.rect.right) - max(bubble.left, it.rect.left)) *
+                           (min(bubble.bottom, it.rect.bottom) - max(bubble.top, it.rect.top)) >= 0.45 * it.rect.width() * it.rect.height())]
+            if boxes_in_b:
+                has_line = any(
+                    l.category == "BUBBLED" and (bubble.contains(l.rect.centerX(), l.rect.centerY()) or
+                    (max(bubble.left, l.rect.left) < min(bubble.right, l.rect.right) and
+                     max(bubble.top, l.rect.top) < min(bubble.bottom, l.rect.bottom)))
+                    for l in deduplicated
+                )
+                if not has_line:
+                    min_l = min(it.rect.left for it in boxes_in_b)
+                    max_r = max(it.rect.right for it in boxes_in_b)
+                    min_t = min(it.rect.top for it in boxes_in_b)
+                    max_b = max(it.rect.bottom for it in boxes_in_b)
+                    half_w = int(median_char_w * 0.54)
+                    cx = (min_l + max_r) // 2
+                    cl_l = max(bubble.left, min(cx - half_w, min_l))
+                    cl_r = min(bubble.right, max(cx + half_w, max_r))
+                    cl_t = max(bubble.top, min_t)
+                    cl_b = min(bubble.bottom, max_b)
+                    deduplicated.append(TextLineItem(id=0, rect=Rect(cl_l, cl_t, cl_r, cl_b), category="BUBBLED"))
 
         # 5. RTL Sort
         if is_rtl:
@@ -221,7 +340,8 @@ class VerticalLineStitcher:
         boxes: List[Rect],
         bubble: Rect,
         global_char_w: float,
-        image_bgr: Optional[np.ndarray] = None
+        image_bgr: Optional[np.ndarray] = None,
+        matching_mask: Optional[BubbleMask] = None
     ) -> Tuple[List[Rect], int]:
         if not boxes:
             return [], 0
@@ -234,16 +354,12 @@ class VerticalLineStitcher:
             ir = min(b.right, bubble.right)
             ib = min(b.bottom, bubble.bottom)
             if ir > il and ib > it and (ir - il) >= 6 and (ib - it) >= 6:
-                clipped.append(Rect(il, it, ir, ib))
+                clipped.append(Rect(il, it, ir, ib, id=b.id))
 
         if not clipped:
             return [], 0
 
-        non_blank = [b for b in clipped if not (image_bgr is not None and VerticalLineStitcher.is_box_blank(image_bgr, b))]
-        if not non_blank:
-            return [], 0
-
-        dedup = VerticalLineStitcher._resolve_nested_boxes(non_blank)
+        dedup = VerticalLineStitcher._resolve_nested_boxes(clipped)
 
         standard_chars = [b for b in dedup if b.height() >= 16 and b.width() >= 12]
         max_allowed_w = max(48.0, global_char_w * 1.5)
@@ -390,6 +506,36 @@ class VerticalLineStitcher:
                 expand_r = min(deficit - expand_l, max(0, bubble.right - clamp_r))
                 clamp_l -= expand_l
                 clamp_r += expand_r
+
+            # Exact Mask Contour Clamping: Clamp column boundaries to the exact boolean pixel mask
+            if matching_mask is not None:
+                row_lefts = []
+                row_rights = []
+                for y in range(max(col.min_top, bubble.top), min(col.max_bottom, bubble.bottom) + 1):
+                    ly = y - matching_mask.rect.top
+                    if 0 <= ly < matching_mask.height:
+                        row = matching_mask.mask[ly, :]
+                        if np.any(row):
+                            active_x = np.where(row)[0]
+                            row_lefts.append(matching_mask.rect.left + int(active_x[0]))
+                            row_rights.append(matching_mask.rect.left + int(active_x[-1]) + 1)
+                if row_lefts and row_rights:
+                    mask_l = max(row_lefts)
+                    mask_r = min(row_rights)
+                    if mask_r - mask_l >= min_col_width_floor:
+                        clamp_l = max(clamp_l, mask_l)
+                        clamp_r = min(clamp_r, mask_r)
+                    else:
+                        p_l = int(np.percentile(row_lefts, 75))
+                        p_r = int(np.percentile(row_rights, 25))
+                        clamp_l = max(clamp_l, p_l)
+                        clamp_r = min(clamp_r, p_r)
+                    # Grounding: Never cut through constituent CTD character boxes
+                    clamp_l = min(clamp_l, col.min_left)
+                    clamp_r = max(clamp_r, col.max_right)
+                    # Stay strictly inside bubble envelope
+                    clamp_l = max(clamp_l, bubble.left)
+                    clamp_r = min(clamp_r, bubble.right)
 
             line = Rect(clamp_l, clamp_t, clamp_r, clamp_b)
             if line.width() >= 8 and line.height() >= 12:
@@ -625,10 +771,18 @@ class VerticalLineStitcher:
                         pri_i = 3 if lines[i].category == "BUBBLED" else (2 if lines[i].category == "ORPHAN" else 1)
                         pri_j = 3 if lines[j].category == "BUBBLED" else (2 if lines[j].category == "ORPHAN" else 1)
                         if pri_i != pri_j:
-                            to_remove.add(j if pri_i > pri_j else i)
+                            survivor = i if pri_i > pri_j else j
+                            victim = j if pri_i > pri_j else i
                         else:
                             area_i = ra.width() * ra.height()
                             area_j = rb.width() * rb.height()
-                            to_remove.add(j if area_i >= area_j else i)
+                            survivor = i if area_i >= area_j else j
+                            victim = j if survivor == i else i
+
+                        lines[survivor].rect.left = min(lines[survivor].rect.left, lines[victim].rect.left)
+                        lines[survivor].rect.right = max(lines[survivor].rect.right, lines[victim].rect.right)
+                        lines[survivor].rect.top = min(lines[survivor].rect.top, lines[victim].rect.top)
+                        lines[survivor].rect.bottom = max(lines[survivor].rect.bottom, lines[victim].rect.bottom)
+                        to_remove.add(victim)
 
         return [lines[i] for i in range(len(lines)) if i not in to_remove]

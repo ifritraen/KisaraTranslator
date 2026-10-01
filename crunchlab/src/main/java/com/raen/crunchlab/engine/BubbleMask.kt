@@ -11,6 +11,9 @@ data class BubbleMask(
     val width: Int,
     val height: Int,
     val fillArea: Int,
+    val isLobe: Boolean = false,
+    val parentBubbleIndex: Int? = null,
+    val id: Int = 0,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

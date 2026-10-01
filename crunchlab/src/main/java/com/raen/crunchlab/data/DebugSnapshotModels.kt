@@ -92,6 +92,7 @@ data class DialogueLineItem(
     val lineId: Int,
     val rect: Rect,
     val readingOrder: Int, // 1, 2, 3... within group (RTL order)
+    val recognizedText: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("lineId", lineId)
@@ -100,13 +101,15 @@ data class DialogueLineItem(
         put("r", rect.right)
         put("b", rect.bottom)
         put("order", readingOrder)
+        if (recognizedText.isNotBlank()) put("text", recognizedText)
     }
 
     companion object {
         fun fromJson(obj: JSONObject): DialogueLineItem = DialogueLineItem(
             lineId = obj.getInt("lineId"),
             rect = Rect(obj.getInt("l"), obj.getInt("t"), obj.getInt("r"), obj.getInt("b")),
-            readingOrder = obj.optInt("order", 1)
+            readingOrder = obj.optInt("order", 1),
+            recognizedText = obj.optString("text", "")
         )
     }
 }
@@ -187,8 +190,78 @@ data class OcrCropDebugItem(
     val cropBitmap: Bitmap?,
     val rawText: String,
     val isBubble: Boolean = true,
+    val lineId: Int? = null,
+    val readingOrder: Int? = null,
     val durationMs: Long = 0L,
 )
+
+data class TypesetLineItem(
+    val text: String,
+    val y: Float,
+    val xCenter: Float,
+    val chordWidth: Float,
+    val scaleX: Float = 1.0f,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("text", text)
+        put("y", y.toDouble())
+        put("xc", xCenter.toDouble())
+        put("cw", chordWidth.toDouble())
+        put("sx", scaleX.toDouble())
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject): TypesetLineItem = TypesetLineItem(
+            text = obj.getString("text"),
+            y = obj.getDouble("y").toFloat(),
+            xCenter = obj.getDouble("xc").toFloat(),
+            chordWidth = obj.getDouble("cw").toFloat(),
+            scaleX = obj.optDouble("sx", 1.0).toFloat(),
+        )
+    }
+}
+
+data class TypesetBlockItem(
+    val groupId: Int,
+    val isBubble: Boolean,
+    val bounds: Rect,
+    val fontSize: Float,
+    val lines: List<TypesetLineItem>,
+    val originalJapanese: String = "",
+    val translatedEnglish: String = "",
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("groupId", groupId)
+        put("isBubble", isBubble)
+        put("l", bounds.left)
+        put("t", bounds.top)
+        put("r", bounds.right)
+        put("b", bounds.bottom)
+        put("fontSize", fontSize.toDouble())
+        put("ja", originalJapanese)
+        put("en", translatedEnglish)
+        val lArr = JSONArray()
+        lines.forEach { lArr.put(it.toJson()) }
+        put("lines", lArr)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject): TypesetBlockItem {
+            val lArr = obj.optJSONArray("lines") ?: JSONArray()
+            val lList = mutableListOf<TypesetLineItem>()
+            for (i in 0 until lArr.length()) lList.add(TypesetLineItem.fromJson(lArr.getJSONObject(i)))
+            return TypesetBlockItem(
+                groupId = obj.getInt("groupId"),
+                isBubble = obj.optBoolean("isBubble", true),
+                bounds = Rect(obj.getInt("l"), obj.getInt("t"), obj.getInt("r"), obj.getInt("b")),
+                fontSize = obj.getDouble("fontSize").toFloat(),
+                lines = lList,
+                originalJapanese = obj.optString("ja", ""),
+                translatedEnglish = obj.optString("en", ""),
+            )
+        }
+    }
+}
 
 data class CrunchPartitionItem(
     val bubbleIndex: Int,
@@ -413,24 +486,40 @@ data class ProcessedPage(
     val m1Pass2PassedBoxes: List<Rect> = emptyList(),
     val m1Pass2RejectedBoxes: List<Rect> = emptyList(),
     val m1Pass2Texts: Map<Rect, String> = emptyMap(),
+    val m1DurationMs: Long = 0L,
     // Module 1.5 Data (Categorization):
     val m1_5CategorizedBoxes: List<TextLineItem> = emptyList(),
     val m1_5BubbledCount: Int = 0,
     val m1_5OrphanCount: Int = 0,
     val m1_5SfxCount: Int = 0,
+    val m1_5DurationMs: Long = 0L,
     // Module 2 Data (Single Vertical Lines):
     val m2VerticalLines: List<TextLineItem> = emptyList(),
     val m2ConjoinedSplitBubbles: List<Rect> = emptyList(),
     val m2SuppressedFuriganaCount: Int = 0,
+    val m2DurationMs: Long = 0L,
     // Module 3 Data:
     val m3Partitions: List<CrunchPartitionItem> = emptyList(),
+    val m3DurationMs: Long = 0L,
     // Module 4 Data (Data Prepare & MangaOCR):
     val m4DialogueGroups: List<DialogueGroupItem> = emptyList(),
     val m4OcrBlocks: List<TranslationBlock> = emptyList(),
     val m4OcrCrops: List<OcrCropDebugItem> = emptyList(),
+    val m4PrepDurationMs: Long = 0L,
     val m4OcrDurationMs: Long = 0L,
     // Module 5 Data (Translation):
     val m5TranslatedGroups: List<DialogueGroupItem> = emptyList(),
     val m5EngineType: String = "",
     val m5DurationMs: Long = 0L,
-)
+    // Module 6 Data (Inpainting & Typesetting):
+    var m6CleanBitmap: Bitmap? = null,
+    val m6TypesetBlocks: List<TypesetBlockItem> = emptyList(),
+    var m6FinalBitmap: Bitmap? = null,
+    val m6InpaintDurationMs: Long = 0L,
+    val m6TypesetDurationMs: Long = 0L,
+) {
+    val totalDurationMs: Long
+        get() = m1DurationMs + m1_5DurationMs + m2DurationMs + m3DurationMs +
+                m4PrepDurationMs + m4OcrDurationMs + m5DurationMs +
+                m6InpaintDurationMs + m6TypesetDurationMs
+}

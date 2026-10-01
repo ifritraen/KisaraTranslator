@@ -26,6 +26,19 @@ class BubbleSegmentationEngine(
     private var session: OrtSession? = null
     private var loadedPath: String? = null
 
+    var configuredThreads: Int = 4
+    var hardwareDelegate: com.raen.crunchlab.engine.profile.HardwareDelegate = com.raen.crunchlab.engine.profile.HardwareDelegate.XNNPACK
+
+    fun setResourceConfig(threads: Int, delegate: com.raen.crunchlab.engine.profile.HardwareDelegate = hardwareDelegate) {
+        if (threads != configuredThreads || delegate != hardwareDelegate) {
+            configuredThreads = threads
+            hardwareDelegate = delegate
+            session?.close()
+            session = null
+            loadedPath = null
+        }
+    }
+
     val isReady: Boolean
         get() {
             ensureSession()
@@ -43,12 +56,12 @@ class BubbleSegmentationEngine(
         session?.close(); session = null; loadedPath = null
         if (!modelFile.exists() || modelFile.length() < ModelDownloader.MIN_SIZE) return false
 
-        val opts = com.raen.crunchlab.util.AiBufferUtils.createSessionOptions(2)
+        val opts = com.raen.crunchlab.util.AiBufferUtils.createSessionOptions(configuredThreads, hardwareDelegate)
 
         return try {
             session = env.createSession(modelFile.absolutePath, opts)
             loadedPath = modelFile.absolutePath
-            Log.i("CrunchLab", "Loaded segmentation model: ${modelFile.name} (${modelFile.length() / 1024}KB)")
+            Log.i("CrunchLab", "Loaded segmentation model ($configuredThreads-threads, ${hardwareDelegate.shortLabel}): ${modelFile.name} (${modelFile.length() / 1024}KB)")
             true
         } catch (e: Exception) {
             Log.e("CrunchLab", "Model load failed: ${e.message}")

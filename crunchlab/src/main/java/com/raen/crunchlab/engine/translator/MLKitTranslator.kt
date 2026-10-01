@@ -6,7 +6,9 @@ import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 /**
@@ -79,10 +81,12 @@ class MLKitTranslator : TextTranslator {
         var completed = 0
 
         for (text in texts) {
+            coroutineContext.ensureActive()
             val res = if (text.isNotBlank()) {
                 try {
                     translate(text)
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     Log.e("MLKitTranslator", "Error translating: '$text'", e)
                     text
                 }

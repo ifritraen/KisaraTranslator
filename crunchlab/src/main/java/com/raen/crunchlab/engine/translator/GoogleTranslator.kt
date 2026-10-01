@@ -1,10 +1,12 @@
 package com.raen.crunchlab.engine.translator
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -105,10 +107,12 @@ class GoogleTranslator(
         val completed = AtomicInteger(0)
         val deferredList = texts.mapIndexed { idx, text ->
             async(Dispatchers.IO) {
+                coroutineContext.ensureActive()
                 val res = if (text.isNotBlank()) {
                     try {
                         translate(text)
                     } catch (e: Exception) {
+                        if (e is CancellationException) throw e
                         Log.e("GoogleTranslator", "Error translating [$idx]: '$text'", e)
                         text
                     }

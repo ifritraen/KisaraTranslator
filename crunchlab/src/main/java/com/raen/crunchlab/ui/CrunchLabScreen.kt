@@ -25,8 +25,11 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -41,7 +44,9 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FastForward
+import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -87,16 +92,24 @@ import com.raen.crunchlab.data.OcrCropDebugItem
 import com.raen.crunchlab.data.TranslationBlock
 import com.raen.crunchlab.engine.BubbleMask
 import com.raen.crunchlab.engine.BubbleSegmentationEngine
+import com.raen.crunchlab.data.TypesetBlockItem
+import com.raen.crunchlab.data.TypesetLineItem
 import com.raen.crunchlab.engine.ComicTextDetector
 import com.raen.crunchlab.engine.Method3WaistEngine
 import com.raen.crunchlab.engine.grouping.DialogueGroupPreparer
 import com.raen.crunchlab.engine.grouping.TextCategorizer
 import com.raen.crunchlab.engine.grouping.VerticalLineStitcher
+import com.raen.crunchlab.engine.inpaint.MangaInpainter
 import com.raen.crunchlab.engine.recognizer.MangaOcrEngine
 import com.raen.crunchlab.engine.translator.GoogleTranslator
 import com.raen.crunchlab.engine.translator.MLKitTranslator
 import com.raen.crunchlab.engine.translator.SugoiTranslator
 import com.raen.crunchlab.engine.translator.TextTranslator
+import com.raen.crunchlab.engine.typeset.DynamicChordTypesetter
+import com.raen.crunchlab.engine.profile.DeviceProfileManager
+import com.raen.crunchlab.engine.profile.HardwareDelegate
+import com.raen.crunchlab.engine.profile.ResourceProfile
+import com.raen.crunchlab.ui.CrunchSettingsSheet
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -145,13 +158,15 @@ enum class DebugModule(val id: Int, val shortTag: String, val shortName: String,
     MODULE_2_LINES(3, "M2", "M2: Vertical Lines", "Module 2: Single Vertical Lines"),
     MODULE_3_CRUNCH(4, "M3", "M3: Waist Crunch", "Module 3: Waist Crunch (Method 3)"),
     MODULE_4_OCR(5, "M4", "M4: MangaOCR", "Module 4: Dialogue Grouping & MangaOCR"),
-    MODULE_5_TRANSLATE(6, "M5", "M5: Translate", "Module 5: Text Translation (Google / ML Kit / Sugoi)")
+    MODULE_5_TRANSLATE(6, "M5", "M5: Translate", "Module 5: Text Translation (Google / ML Kit / Sugoi)"),
+    MODULE_6_TYPESET(7, "M6", "M6: Typeset", "Module 6: Inpainting & Dynamic Typesetting"),
+    FINAL_OUTPUT(8, "Final", "Final: Translated", "Final: Translated Manga Page")
 }
 
 enum class TranslationEngineType(val displayName: String, val badge: String) {
+    SUGOI("Sugoi ONNX", "🤖 Sugoi"),
     GOOGLE("Google Translate", "🌐 Google"),
-    MLKIT("Google ML Kit", "📱 ML Kit"),
-    SUGOI("Sugoi ONNX", "🤖 Sugoi")
+    MLKIT("Google ML Kit", "📱 ML Kit")
 }
 
 enum class M1SubStep(val id: Int, val label: String) {
@@ -181,6 +196,21 @@ enum class M3SubStep(val id: Int, val label: String) {
 enum class M4SubStep(val id: Int, val label: String) {
     DATA_PREPARE(0, "4.1 Data Prepare"),
     OCR_OUTPUT(1, "4.2 OCR Output")
+}
+
+enum class M6SubStep(val id: Int, val label: String) {
+    CLEAN_CANVAS(0, "6.1 Clean Canvas"),
+    TYPESET_OUTPUT(1, "6.2 Typeset Output")
+}
+
+enum class ModuleRunMode {
+    RUN_UPTO,     // 1. Run sequentially from the beginning (M1) up to targetModule, and stop
+    RUN_CURRENT,  // 2. Take previous module's output directly, run only targetModule, and stop
+    RUN_TO_END    // 3. Run starting from targetModule all the way to the end (FINAL_OUTPUT)
+}
+
+private fun formatSeconds(ms: Long): String {
+    return String.format(Locale.US, "%.2fs", ms / 1000.0)
 }
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
@@ -215,6 +245,24 @@ fun CrunchLabScreen() {
         }
     }
 
+    val detectedSpecs = remember { DeviceProfileManager.detectSpecs(context) }
+    var activeProfile by remember { mutableStateOf(detectedSpecs.recommendedProfile) }
+    var activeDelegate by remember { mutableStateOf(HardwareDelegate.XNNPACK) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
+
+    fun applyResourceConfig(profile: ResourceProfile, delegate: HardwareDelegate) {
+        segEngine.setResourceConfig(profile.threads, delegate)
+        ctdEngine.setResourceConfig(profile.threads, delegate)
+        method3WaistEngine.setResourceConfig(profile.threads, delegate)
+        mangaOcrEngine.setResourceConfig(profile.threads, delegate)
+        sugoiTranslator.setResourceConfig(profile.threads, delegate)
+        Log.i("CrunchLab", "Dynamic Resource Config applied: ${profile.title} (${profile.threads}T, ${profile.targetLoadPercent}%), Delegate: ${delegate.label}")
+    }
+
+    LaunchedEffect(activeProfile, activeDelegate) {
+        applyResourceConfig(activeProfile, activeDelegate)
+    }
+
     var isAllModelsReady by remember { mutableStateOf(downloader.isAllModelsReady()) }
     var showDatasetBrowser by remember { mutableStateOf(false) }
     var showCbzBrowserSheet by remember { mutableStateOf(false) }
@@ -226,7 +274,9 @@ fun CrunchLabScreen() {
     var m2SubStep by remember { mutableStateOf(M2SubStep.ALL_LINES) }
     var m3SubStep by remember { mutableStateOf(M3SubStep.LOBE_PARTITION) }
     var m4SubStep by remember { mutableStateOf(M4SubStep.DATA_PREPARE) }
-    var selectedEngine by remember { mutableStateOf(TranslationEngineType.GOOGLE) }
+    var m6SubStep by remember { mutableStateOf(M6SubStep.TYPESET_OUTPUT) }
+    var compareWithOriginal by remember { mutableStateOf(false) }
+    var selectedEngine by remember { mutableStateOf(TranslationEngineType.SUGOI) }
     var sugoiBeamWidth by remember { mutableIntStateOf(1) }
 
     var processedPages by remember { mutableStateOf<List<ProcessedPage>>(emptyList()) }
@@ -240,22 +290,31 @@ fun CrunchLabScreen() {
     val bubbleListState = rememberLazyListState()
 
     var cleanupJob by remember { mutableStateOf<Job?>(null) }
+    var pipelineJob by remember { mutableStateOf<Job?>(null) }
+
+    fun releaseAllResources() {
+        cleanupJob?.cancel()
+        cleanupJob = null
+        ctdEngine.releaseInferenceBuffers()
+        segEngine.close()
+        method3WaistEngine.close()
+        mangaOcrEngine.close()
+        sugoiTranslator.close()
+        System.gc()
+        System.runFinalization()
+        Log.i("CrunchLab", "Immediate auto-cleanup: Released all ONNX sessions, native buffers, and executed GC (~1.5+GB released)")
+    }
 
     fun scheduleAutoCleanup() {
-        cleanupJob?.cancel()
-        cleanupJob = scope.launch {
-            delay(3000L)
-            withContext(Dispatchers.Default) {
-                ctdEngine.releaseInferenceBuffers()
-                segEngine.close()
-                method3WaistEngine.close()
-                mangaOcrEngine.close()
-                sugoiTranslator.close()
-                System.gc()
-                System.runFinalization()
-                Log.i("CrunchLab", "3-second auto-cleanup: Released ONNX sessions, native buffers, and executed GC")
-            }
-        }
+        releaseAllResources()
+    }
+
+    fun stopProcessing() {
+        pipelineJob?.cancel()
+        pipelineJob = null
+        isProcessing = false
+        statusMessage = "⏹ Process stopped by user"
+        scheduleAutoCleanup()
     }
 
     // Viewport: Zoom, Pan & Wipe Curtain
@@ -271,10 +330,23 @@ fun CrunchLabScreen() {
     var savedSnapshotFiles by remember { mutableStateOf<List<File>>(emptyList()) }
 
     val activePage = processedPages.getOrNull(activePageIndex)
-    val displayBmp = if (activeModule == DebugModule.MODULE_3_CRUNCH) {
-        activePage?.isolatedBitmap ?: activePage?.sourceBitmap
-    } else {
-        activePage?.sourceBitmap
+    val displayBmp = when (activeModule) {
+        DebugModule.MODULE_3_CRUNCH -> activePage?.isolatedBitmap ?: activePage?.sourceBitmap
+        DebugModule.MODULE_6_TYPESET -> {
+            if (m6SubStep == M6SubStep.CLEAN_CANVAS) {
+                activePage?.m6CleanBitmap ?: activePage?.sourceBitmap
+            } else {
+                activePage?.m6FinalBitmap ?: activePage?.sourceBitmap
+            }
+        }
+        DebugModule.FINAL_OUTPUT -> {
+            if (compareWithOriginal) {
+                activePage?.sourceBitmap
+            } else {
+                activePage?.m6FinalBitmap ?: activePage?.sourceBitmap
+            }
+        }
+        else -> activePage?.sourceBitmap
     }
 
     // Helper: Generate Heatmap Bitmap from FloatArray (Step 1.1)
@@ -302,49 +374,216 @@ fun CrunchLabScreen() {
         return bmp
     }
 
-    // Pipeline Execution Engine with Strict Upstream-Only Dependencies
-    fun runModule(targetModule: DebugModule, forceUpstream: Boolean = false) {
+    // Pipeline Execution Engine with Dynamic Caching & Multi-Mode Support
+    fun runModule(targetModule: DebugModule, mode: ModuleRunMode = ModuleRunMode.RUN_CURRENT) {
         val page = processedPages.getOrNull(activePageIndex) ?: return
         cleanupJob?.cancel()
-        scope.launch {
+        pipelineJob?.cancel()
+        pipelineJob = scope.launch {
             isProcessing = true
             try {
+                coroutineContext.ensureActive()
                 var curr = page
                 val bmp = curr.sourceBitmap
 
-                // Model Check
-                val needM1 = curr.m1Lines.isEmpty() || forceUpstream || targetModule == DebugModule.MODULE_1_CTD
-                if (needM1 && !downloader.isComicTextModelReady()) {
+                // Cache status flags
+                val hasM1 = curr.m1Lines.isNotEmpty()
+                val hasM1_5 = curr.m1_5CategorizedBoxes.isNotEmpty()
+                val hasM2 = curr.m2VerticalLines.isNotEmpty()
+                val hasM3 = curr.m3Partitions.isNotEmpty() && curr.isolatedBitmap != null
+                val hasM4 = curr.m4DialogueGroups.isNotEmpty() && curr.m4DialogueGroups.any { it.recognizedText.isNotBlank() }
+                val hasM5 = curr.m5TranslatedGroups.isNotEmpty() && curr.m5TranslatedGroups.any { it.translatedText.isNotBlank() }
+                val hasM6 = curr.m6FinalBitmap != null
+
+                // Determine execution flags
+                val shouldRunM1: Boolean
+                val shouldRunM1_5: Boolean
+                val shouldRunM2: Boolean
+                val shouldRunM3: Boolean
+                val shouldRunM4: Boolean
+                val shouldRunM5: Boolean
+                val shouldRunM6: Boolean
+
+                when (mode) {
+                    ModuleRunMode.RUN_UPTO -> {
+                        // 1. Run sequentially from beginning (M1) up to targetModule, forcing fresh recomputation
+                        shouldRunM1 = true
+                        shouldRunM1_5 = targetModule.id >= DebugModule.MODULE_1_5_CATEGORIZE.id
+                        shouldRunM2 = targetModule.id >= DebugModule.MODULE_2_LINES.id
+                        shouldRunM3 = targetModule.id >= DebugModule.MODULE_3_CRUNCH.id
+                        shouldRunM4 = targetModule.id >= DebugModule.MODULE_4_OCR.id
+                        shouldRunM5 = targetModule.id >= DebugModule.MODULE_5_TRANSLATE.id
+                        shouldRunM6 = targetModule.id >= DebugModule.MODULE_6_TYPESET.id
+                    }
+                    ModuleRunMode.RUN_CURRENT -> {
+                        // 2. Take previous module's output directly, run only targetModule, and stop
+                        when (targetModule) {
+                            DebugModule.MODULE_1_CTD -> {
+                                shouldRunM1 = true
+                                shouldRunM1_5 = false; shouldRunM2 = false; shouldRunM3 = false
+                                shouldRunM4 = false; shouldRunM5 = false; shouldRunM6 = false
+                            }
+                            DebugModule.MODULE_1_5_CATEGORIZE -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = true
+                                shouldRunM2 = false; shouldRunM3 = false; shouldRunM4 = false; shouldRunM5 = false; shouldRunM6 = false
+                            }
+                            DebugModule.MODULE_2_LINES -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = true
+                                shouldRunM3 = false; shouldRunM4 = false; shouldRunM5 = false; shouldRunM6 = false
+                            }
+                            DebugModule.MODULE_3_CRUNCH -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = true
+                                shouldRunM4 = false; shouldRunM5 = false; shouldRunM6 = false
+                            }
+                            DebugModule.MODULE_4_OCR -> {
+                                // M1..M3 is saved! Keep M1..M3 untouched; run only M4
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = true
+                                shouldRunM5 = false; shouldRunM6 = false
+                            }
+                            DebugModule.MODULE_5_TRANSLATE -> {
+                                // Run M5 using M4's output
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = !hasM4
+                                shouldRunM5 = true
+                                shouldRunM6 = false
+                            }
+                            DebugModule.MODULE_6_TYPESET -> {
+                                // Run M6 using M5's output
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = !hasM4
+                                shouldRunM5 = !hasM5
+                                shouldRunM6 = true
+                            }
+                            DebugModule.FINAL_OUTPUT -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = !hasM4
+                                shouldRunM5 = !hasM5
+                                shouldRunM6 = !hasM6
+                            }
+                        }
+                    }
+                    ModuleRunMode.RUN_TO_END -> {
+                        // 3. Run starting from targetModule all the way to FINAL_OUTPUT
+                        when (targetModule) {
+                            DebugModule.MODULE_1_CTD -> {
+                                shouldRunM1 = true
+                                shouldRunM1_5 = true; shouldRunM2 = true; shouldRunM3 = true
+                                shouldRunM4 = true; shouldRunM5 = true; shouldRunM6 = true
+                            }
+                            DebugModule.MODULE_1_5_CATEGORIZE -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = true
+                                shouldRunM2 = true; shouldRunM3 = true
+                                shouldRunM4 = true; shouldRunM5 = true; shouldRunM6 = true
+                            }
+                            DebugModule.MODULE_2_LINES -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = true
+                                shouldRunM3 = true; shouldRunM4 = true; shouldRunM5 = true; shouldRunM6 = true
+                            }
+                            DebugModule.MODULE_3_CRUNCH -> {
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = true
+                                shouldRunM4 = true; shouldRunM5 = true; shouldRunM6 = true
+                            }
+                            DebugModule.MODULE_4_OCR -> {
+                                // Up to M3 is saved! Run M4 -> M5 -> M6 -> Final
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = true
+                                shouldRunM5 = true; shouldRunM6 = true
+                            }
+                            DebugModule.MODULE_5_TRANSLATE -> {
+                                // M1..M4 is saved! Run M5 -> M6 -> Final
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = !hasM4
+                                shouldRunM5 = true
+                                shouldRunM6 = true
+                            }
+                            DebugModule.MODULE_6_TYPESET -> {
+                                // M1..M5 is saved! Run M6 -> Final
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = !hasM4
+                                shouldRunM5 = !hasM5
+                                shouldRunM6 = true
+                            }
+                            DebugModule.FINAL_OUTPUT -> {
+                                // Up to M3 is saved! Starts from M4 if needed, upper modules get from previous module output
+                                shouldRunM1 = !hasM1
+                                shouldRunM1_5 = !hasM1_5
+                                shouldRunM2 = !hasM2
+                                shouldRunM3 = !hasM3
+                                shouldRunM4 = !hasM4
+                                shouldRunM5 = !hasM5
+                                shouldRunM6 = !hasM6 || shouldRunM5 || shouldRunM4
+                            }
+                        }
+                    }
+                }
+
+                // Model Check for modules scheduled to run
+                if (shouldRunM1 && !downloader.isComicTextModelReady()) {
                     statusMessage = "ComicText model missing. Please click Get Models."
                     isProcessing = false
                     return@launch
                 }
-                if (targetModule == DebugModule.MODULE_3_CRUNCH || targetModule == DebugModule.MODULE_4_OCR || targetModule == DebugModule.MODULE_5_TRANSLATE) {
-                    if (!downloader.isBubbleModelReady() || !downloader.isWaistModelReady()) {
-                        statusMessage = "BubbleSeg or Waist model missing (place manga_waist_model.onnx in Download)."
-                        isProcessing = false
-                        return@launch
-                    }
+                if ((shouldRunM1_5 || shouldRunM3) && (!downloader.isBubbleModelReady() || !downloader.isWaistModelReady())) {
+                    statusMessage = "BubbleSeg or Waist model missing (place manga_waist_model.onnx in Download)."
+                    isProcessing = false
+                    return@launch
                 }
-                if (targetModule == DebugModule.MODULE_5_TRANSLATE && selectedEngine == TranslationEngineType.SUGOI) {
-                    if (!downloader.isSugoiReady()) {
-                        statusMessage = "Sugoi ONNX missing. Place encoder, decoder & sugoi_vocab.json in Download/sugoi."
-                        isProcessing = false
-                        return@launch
-                    }
+                if (shouldRunM4 && !downloader.isMangaOcrReady()) {
+                    statusMessage = "MangaOCR models missing. Please click Get MangaOCR."
+                    isProcessing = false
+                    return@launch
+                }
+                if (shouldRunM5 && selectedEngine == TranslationEngineType.SUGOI && !downloader.isSugoiReady()) {
+                    statusMessage = "Sugoi ONNX missing. Place encoder, decoder & sugoi_vocab.json in Download/sugoi."
+                    isProcessing = false
+                    return@launch
                 }
 
-                // Upstream Invariant: Only run upstream modules (M1 -> targetModule)
-                // If M1 is already run, skip M1 and take the output data of M1!
-
-                // Dependency 1: Module 1 (CTD Detection & Continuous Heatmap)
-                if (needM1) {
+                // ─── Module 1 (CTD Detection & Continuous Heatmap) ───
+                if (shouldRunM1) {
+                    coroutineContext.ensureActive()
                     statusMessage = "[M1] CTD Detection & Heatmap extraction for ${curr.label}..."
+                    val t0 = System.currentTimeMillis()
                     val res = withContext(Dispatchers.Default) {
                         ctdEngine.runModule1(bmp) { msg ->
                             statusMessage = msg
                         }
                     }
+                    val m1Time = System.currentTimeMillis() - t0
                     curr = curr.copy(
                         m1TextProb = res.probMap,
                         m1Lines = res.lines,
@@ -354,87 +593,102 @@ fun CrunchLabScreen() {
                         m1Pass2PassedBoxes = res.pass2PassedBoxes,
                         m1Pass2RejectedBoxes = res.pass2RejectedBoxes,
                         m1Pass2Texts = res.pass2BoxTexts,
-                        m1HeatmapBitmap = null
+                        m1HeatmapBitmap = null,
+                        m1DurationMs = m1Time
                     )
                 }
 
-                // Dependency 2: Module 1.5 (Categorization: Bubbled, Orphan, SFX)
-                if (targetModule.id >= 2) {
-                    val needM1_5 = needM1 || curr.m1_5CategorizedBoxes.isEmpty() || targetModule == DebugModule.MODULE_1_5_CATEGORIZE || forceUpstream
-                    if (needM1_5) {
-                        val (masks, splitBubbles, parts) = if (curr.detectedMasks.isNotEmpty() && !forceUpstream) {
-                            Triple(curr.detectedMasks, curr.m2ConjoinedSplitBubbles, curr.m3Partitions)
-                        } else {
-                            statusMessage = "[M1.5] Running Manga109 bubble segmentation..."
-                            val rawMasks = withContext(Dispatchers.Default) {
-                                segEngine.detectMasks(bmp)
-                            }
-                            statusMessage = "[M1.5] Pre-partitioning conjoined bubble lobes..."
-                            val (partitionedMasks, partitionedBubbles, partitions) = withContext(Dispatchers.Default) {
-                                method3WaistEngine.partitionConjoinedBubbles(bmp, rawMasks, curr.m1Bubbles)
-                            }
-                            Triple(partitionedMasks, partitionedBubbles, partitions)
+                // ─── Module 1.5 (Categorization: Bubbled, Orphan, SFX) ───
+                if (shouldRunM1_5) {
+                    coroutineContext.ensureActive()
+                    val t0 = System.currentTimeMillis()
+                    val (masks, splitBubbles, parts) = if (curr.detectedMasks.isNotEmpty() && !shouldRunM1) {
+                        Triple(curr.detectedMasks, curr.m2ConjoinedSplitBubbles, curr.m3Partitions)
+                    } else {
+                        statusMessage = "[M1.5] Running Manga109 bubble segmentation..."
+                        val rawMasks = withContext(Dispatchers.Default) {
+                            segEngine.detectMasks(bmp)
                         }
+                        statusMessage = "[M1.5] Pre-partitioning conjoined bubble lobes..."
+                        val (partitionedMasks, partitionedBubbles, partitions) = withContext(Dispatchers.Default) {
+                            method3WaistEngine.partitionConjoinedBubbles(bmp, rawMasks, curr.m1Bubbles)
+                        }
+                        Triple(partitionedMasks, partitionedBubbles, partitions)
+                    }
 
-                        statusMessage = "[M1.5] Categorizing character boxes into Bubbled, Orphan, and SFX..."
-                        val catRes = withContext(Dispatchers.Default) {
-                            TextCategorizer.categorizeBoxes(
-                                rawBoxes = curr.m1Lines.map { it.rect },
-                                bubbleRegions = if (splitBubbles.isNotEmpty()) splitBubbles else curr.m1Bubbles,
-                                bubbleMasks = masks,
-                                bitmap = bmp,
-                                bitmapWidth = bmp.width,
-                                bitmapHeight = bmp.height,
-                                isRtl = true
-                            )
-                        }
-                        curr = curr.copy(
-                            detectedMasks = masks,
-                            m2ConjoinedSplitBubbles = splitBubbles,
-                            m3Partitions = parts,
-                            m1_5CategorizedBoxes = catRes.allBoxes,
-                            m1_5BubbledCount = catRes.bubbledBoxes.size,
-                            m1_5OrphanCount = catRes.orphanBoxes.size,
-                            m1_5SfxCount = catRes.sfxBoxes.size
+                    statusMessage = "[M1.5] Categorizing character boxes into Bubbled, Orphan, and SFX..."
+                    val realBubbleRects = when {
+                        splitBubbles.isNotEmpty() -> splitBubbles
+                        masks.isNotEmpty() -> masks.map { it.rect }
+                        else -> emptyList()
+                    }
+                    val catRes = withContext(Dispatchers.Default) {
+                        TextCategorizer.categorizeBoxes(
+                            rawBoxes = curr.m1Lines.map { it.rect },
+                            bubbleRegions = realBubbleRects,
+                            bubbleMasks = masks,
+                            ctdBubbles = curr.m1Bubbles,
+                            bitmap = bmp,
+                            bitmapWidth = bmp.width,
+                            bitmapHeight = bmp.height,
+                            isRtl = true
                         )
                     }
+                    val m1_5Time = System.currentTimeMillis() - t0
+                    curr = curr.copy(
+                        detectedMasks = masks,
+                        m2ConjoinedSplitBubbles = splitBubbles,
+                        m3Partitions = parts,
+                        m1_5CategorizedBoxes = catRes.allBoxes,
+                        m1_5BubbledCount = catRes.bubbledBoxes.size,
+                        m1_5OrphanCount = catRes.orphanBoxes.size,
+                        m1_5SfxCount = catRes.sfxBoxes.size,
+                        m1_5DurationMs = m1_5Time
+                    )
                 }
 
-                // Dependency 3: Module 2 (Single Vertical Line Stitching per Column)
-                if (targetModule.id >= 3) {
-                    val needM2 = needM1 || curr.m2VerticalLines.isEmpty() || targetModule == DebugModule.MODULE_2_LINES || forceUpstream
-                    if (needM2) {
-                        val masks = curr.detectedMasks
-                        statusMessage = "[M2] Stitching character boxes into single vertical lines per column..."
-                        val rawBoxes = curr.m1_5CategorizedBoxes.ifEmpty {
-                            curr.m1Lines.map { it.copy(category = TextCategory.BUBBLED) }
-                        }
-                        val bubbleRegions = if (curr.m2ConjoinedSplitBubbles.isNotEmpty()) curr.m2ConjoinedSplitBubbles else curr.m1Bubbles
-                        val stitchedOut = withContext(Dispatchers.Default) {
-                            VerticalLineStitcher.stitchLines(
-                                categorizedBoxes = rawBoxes,
-                                bubbleRegions = bubbleRegions,
-                                bubbleMasks = masks,
-                                bitmap = bmp,
-                                bitmapWidth = bmp.width,
-                                bitmapHeight = bmp.height,
-                                isRtl = true
-                            )
-                        }
-                        val updatedPartitions = if (curr.m3Partitions.isNotEmpty()) {
-                            method3WaistEngine.assignPartitionLines(curr.m3Partitions, stitchedOut.allLines)
-                        } else emptyList()
-                        curr = curr.copy(
-                            m2VerticalLines = stitchedOut.allLines,
-                            m2SuppressedFuriganaCount = stitchedOut.suppressedFuriganaCount,
-                            m3Partitions = if (updatedPartitions.isNotEmpty()) updatedPartitions else curr.m3Partitions
+                // ─── Module 2 (Single Vertical Line Stitching per Column) ───
+                if (shouldRunM2) {
+                    coroutineContext.ensureActive()
+                    val t0 = System.currentTimeMillis()
+                    val masks = curr.detectedMasks
+                    statusMessage = "[M2] Stitching character boxes into single vertical lines per column..."
+                    val rawBoxes = curr.m1_5CategorizedBoxes.ifEmpty {
+                        curr.m1Lines.map { it.copy(category = TextCategory.BUBBLED) }
+                    }
+                    val bubbleRegions = when {
+                        curr.m2ConjoinedSplitBubbles.isNotEmpty() -> curr.m2ConjoinedSplitBubbles
+                        curr.detectedMasks.isNotEmpty() -> curr.detectedMasks.map { it.rect }
+                        else -> emptyList()
+                    }
+                    val stitchedOut = withContext(Dispatchers.Default) {
+                        VerticalLineStitcher.stitchLines(
+                            categorizedBoxes = rawBoxes,
+                            bubbleRegions = bubbleRegions,
+                            bubbleMasks = masks,
+                            bitmap = bmp,
+                            bitmapWidth = bmp.width,
+                            bitmapHeight = bmp.height,
+                            isRtl = true
                         )
                     }
+                    val updatedPartitions = if (curr.m3Partitions.isNotEmpty()) {
+                        method3WaistEngine.assignPartitionLines(curr.m3Partitions, stitchedOut.allLines)
+                    } else emptyList()
+                    val m2Time = System.currentTimeMillis() - t0
+                    curr = curr.copy(
+                        m2VerticalLines = stitchedOut.allLines,
+                        m2SuppressedFuriganaCount = stitchedOut.suppressedFuriganaCount,
+                        m3Partitions = if (updatedPartitions.isNotEmpty()) updatedPartitions else curr.m3Partitions,
+                        m2DurationMs = m2Time
+                    )
                 }
 
-                // Target: Module 3 (Waist Crunch Method 3)
-                if (targetModule.id >= 4) {
-                    val (masks, splitBubbles, initialPartitions) = if (curr.detectedMasks.isNotEmpty() && !forceUpstream) {
+                // ─── Module 3 (Waist Crunch Method 3) ───
+                if (shouldRunM3) {
+                    coroutineContext.ensureActive()
+                    val t0 = System.currentTimeMillis()
+                    val (masks, splitBubbles, initialPartitions) = if (curr.detectedMasks.isNotEmpty() && !shouldRunM1 && !shouldRunM1_5) {
                         Triple(curr.detectedMasks, curr.m2ConjoinedSplitBubbles, curr.m3Partitions)
                     } else {
                         statusMessage = "[M3] Running Manga109 bubble segmentation & conjoined pre-partitioning..."
@@ -459,22 +713,30 @@ fun CrunchLabScreen() {
                     val isolated = withContext(Dispatchers.Default) {
                         IsolatedBubbleRenderer.renderIsolatedBubbles(bmp, masks)
                     } ?: bmp
+                    val m3Time = System.currentTimeMillis() - t0
 
                     curr = curr.copy(
                         isolatedBitmap = isolated,
                         detectedMasks = masks,
                         m2ConjoinedSplitBubbles = splitBubbles,
-                        m3Partitions = partitions
+                        m3Partitions = partitions,
+                        m3DurationMs = m3Time
                     )
                 }
 
-                // Target: Module 4 (Dialogue Data Prepare & MangaOCR)
-                if (targetModule.id >= 5) {
+                // ─── Module 4 (Dialogue Data Prepare & MangaOCR) ───
+                if (shouldRunM4) {
+                    coroutineContext.ensureActive()
                     statusMessage = "[M4.1] Preparing dialogue groups (Bubbled + Orphans, excluding SFX)..."
+                    val t0 = System.currentTimeMillis()
                     val groups = withContext(Dispatchers.Default) {
                         DialogueGroupPreparer.prepareGroups(
                             verticalLines = curr.m2VerticalLines.ifEmpty { curr.m1Lines },
-                            bubbleRegions = if (curr.m2ConjoinedSplitBubbles.isNotEmpty()) curr.m2ConjoinedSplitBubbles else curr.m1Bubbles,
+                            bubbleRegions = when {
+                                curr.m2ConjoinedSplitBubbles.isNotEmpty() -> curr.m2ConjoinedSplitBubbles
+                                curr.detectedMasks.isNotEmpty() -> curr.detectedMasks.map { it.rect }
+                                else -> emptyList()
+                            },
                             bubbleMasks = curr.detectedMasks,
                             partitions = curr.m3Partitions,
                             bitmapWidth = bmp.width,
@@ -482,22 +744,24 @@ fun CrunchLabScreen() {
                             isRtl = true
                         )
                     }
+                    val prepTime = System.currentTimeMillis() - t0
 
                     if (downloader.isMangaOcrReady()) {
-                        statusMessage = "[M4.2] Running MangaOCR on ${groups.size} dialogue groups..."
+                        val totalLinesToOcr = groups.sumOf { it.lines.size }
+                        statusMessage = "[M4.2] Running MangaOCR on $totalLinesToOcr vertical lines across ${groups.size} groups..."
                         val ocrRes = withContext(Dispatchers.Default) {
                             mangaOcrEngine.executeDialogueOcr(
                                 bitmap = bmp,
-                                groups = groups,
-                                chunkLinesCount = 2
+                                groups = groups
                             ) { done, total, text ->
-                                statusMessage = "[M4.2] OCR ($done/$total): 「${text.take(12)}...」"
+                                statusMessage = "[M4.2] OCR ($done/$total lines): 「${text.take(12)}...」"
                             }
                         }
                         curr = curr.copy(
                             m4DialogueGroups = ocrRes.updatedGroups,
                             m4OcrBlocks = ocrRes.blocks,
                             m4OcrCrops = ocrRes.crops,
+                            m4PrepDurationMs = prepTime,
                             m4OcrDurationMs = ocrRes.durationMs
                         )
                     } else {
@@ -505,13 +769,15 @@ fun CrunchLabScreen() {
                             m4DialogueGroups = groups,
                             m4OcrBlocks = emptyList(),
                             m4OcrCrops = emptyList(),
+                            m4PrepDurationMs = prepTime,
                             m4OcrDurationMs = 0L
                         )
                     }
                 }
 
-                // Target: Module 5 (Translation: Google / ML Kit / Sugoi)
-                if (targetModule.id >= 6) {
+                // ─── Module 5 (Translation: Google / ML Kit / Sugoi) ───
+                if (shouldRunM5) {
+                    coroutineContext.ensureActive()
                     val inputGroups = curr.m4DialogueGroups
                     if (inputGroups.isEmpty()) {
                         statusMessage = "[M5] No dialogue groups found. Run Module 4 first!"
@@ -528,7 +794,7 @@ fun CrunchLabScreen() {
                         val engineLabel = when (selectedEngine) {
                             TranslationEngineType.GOOGLE -> "Google Translate"
                             TranslationEngineType.MLKIT -> "Google ML Kit"
-                            TranslationEngineType.SUGOI -> "Sugoi V4 ONNX (Beam $sugoiBeamWidth)"
+                            TranslationEngineType.SUGOI -> if (sugoiBeamWidth <= 1) "Sugoi V4 ONNX (⚡ Fast)" else "Sugoi V4 ONNX (✨ Quality)"
                         }
 
                         statusMessage = "[M5] Translating ${inputGroups.size} groups with $engineLabel..."
@@ -558,60 +824,463 @@ fun CrunchLabScreen() {
                     }
                 }
 
+                // ─── Module 6 (Inpainting & Dynamic Shape-Aware Chord Typesetting) ───
+                if (shouldRunM6) {
+                    coroutineContext.ensureActive()
+                    val inputGroups = curr.m5TranslatedGroups.ifEmpty { curr.m4DialogueGroups }
+                    if (inputGroups.isEmpty()) {
+                        statusMessage = "[M6] No dialogue groups available. Run upstream modules first!"
+                    } else {
+                        // Step 6.1: Clean Canvas Inpainting
+                        statusMessage = "[M6.1] Inpainting text regions (Bubbles white, Orphans harmonic diffusion)..."
+                        val t0 = System.currentTimeMillis()
+                        val cleanBmp = withContext(Dispatchers.Default) {
+                            MangaInpainter.inpaintCleanCanvas(
+                                original = bmp,
+                                groups = inputGroups,
+                                heatmap = curr.m1TextProb
+                            )
+                        }
+                        val inpaintTime = System.currentTimeMillis() - t0
+
+                        // Step 6.2: Dynamic Shape-Aware Chord Typesetting
+                        coroutineContext.ensureActive()
+                        statusMessage = "[M6.2] Typesetting shape-conforming dialogue lines..."
+                        val typesetRes = withContext(Dispatchers.Default) {
+                            DynamicChordTypesetter.typesetDialogue(
+                                cleanBitmap = cleanBmp,
+                                groups = inputGroups
+                            )
+                        }
+                        curr = curr.copy(
+                            m6CleanBitmap = cleanBmp,
+                            m6InpaintDurationMs = inpaintTime,
+                            m6TypesetBlocks = typesetRes.blocks,
+                            m6FinalBitmap = typesetRes.outputBitmap,
+                            m6TypesetDurationMs = typesetRes.durationMs
+                        )
+                    }
+                }
+
                 val updatedList = processedPages.toMutableList()
                 updatedList[activePageIndex] = curr
                 processedPages = updatedList
-                activeModule = targetModule
 
-                val countMsg = when (targetModule) {
+                val finalTarget = if (mode == ModuleRunMode.RUN_TO_END) DebugModule.FINAL_OUTPUT else targetModule
+                activeModule = finalTarget
+
+                val countMsg = when (finalTarget) {
                     DebugModule.MODULE_1_CTD -> {
-                        "${curr.m1Lines.size} text lines (${curr.m1Bubbles.size} bubbles)"
+                        "${curr.m1Lines.size} text lines (${curr.m1Bubbles.size} bubbles, ${formatSeconds(curr.m1DurationMs)})"
                     }
                     DebugModule.MODULE_1_5_CATEGORIZE -> {
-                        "${curr.m1_5CategorizedBoxes.size} boxes (${curr.m1_5BubbledCount} bubbled, ${curr.m1_5OrphanCount} orphan, ${curr.m1_5SfxCount} sfx)"
+                        "${curr.m1_5CategorizedBoxes.size} boxes (${curr.m1_5BubbledCount} bubbled, ${curr.m1_5OrphanCount} orphan, ${curr.m1_5SfxCount} sfx, ${formatSeconds(curr.m1_5DurationMs)})"
                     }
                     DebugModule.MODULE_2_LINES -> {
                         val bubbled = curr.m2VerticalLines.count { it.category == TextCategory.BUBBLED }
                         val orphan = curr.m2VerticalLines.count { it.category == TextCategory.ORPHAN }
                         val sfx = curr.m2VerticalLines.count { it.category == TextCategory.SFX }
                         val furi = curr.m2SuppressedFuriganaCount
-                        "${curr.m2VerticalLines.size} single vertical lines ($bubbled bubbled, $orphan orphan, $sfx sfx, $furi furigana absorbed)"
+                        "${curr.m2VerticalLines.size} single vertical lines ($bubbled bubbled, $orphan orphan, $sfx sfx, $furi furigana absorbed, ${formatSeconds(curr.m2DurationMs)})"
                     }
                     DebugModule.MODULE_3_CRUNCH -> {
                         val crunched = curr.m3Partitions.count { it.isConjoined }
                         val splits = curr.m3Partitions.sumOf { it.splitLines.size / 2 }
                         val totalCand = curr.m3Partitions.sumOf { it.candidatePoints.size }
-                        if (splits > 0) {
-                            "$crunched conjoined ($totalCand candidates, $splits straddling lines sliced), ${curr.m3Partitions.size} total"
-                        } else {
-                            "$crunched conjoined ($totalCand candidates), ${curr.m3Partitions.size} total"
-                        }
+                        val detail = if (splits > 0) "$crunched conjoined ($totalCand candidates, $splits straddling lines sliced), ${curr.m3Partitions.size} total"
+                                     else "$crunched conjoined ($totalCand candidates), ${curr.m3Partitions.size} total"
+                        "$detail (${formatSeconds(curr.m3DurationMs)})"
                     }
                     DebugModule.MODULE_4_OCR -> {
                         val bGroups = curr.m4DialogueGroups.count { it.isBubble }
                         val oGroups = curr.m4DialogueGroups.count { !it.isBubble }
                         val totalLines = curr.m4DialogueGroups.sumOf { it.lines.size }
                         val textCount = curr.m4DialogueGroups.count { it.recognizedText.isNotBlank() }
-                        "${curr.m4DialogueGroups.size} dialogue groups ($bGroups bubbled, $oGroups orphan, $totalLines lines, $textCount OCR-recognized, ${curr.m4OcrDurationMs}ms)"
+                        "${curr.m4DialogueGroups.size} dialogue groups ($bGroups bubbled, $oGroups orphan, $totalLines lines, $textCount OCR-recognized, prep: ${formatSeconds(curr.m4PrepDurationMs)}, ocr: ${formatSeconds(curr.m4OcrDurationMs)})"
                     }
                     DebugModule.MODULE_5_TRANSLATE -> {
                         val total = curr.m5TranslatedGroups.size
                         val doneCount = curr.m5TranslatedGroups.count { it.translatedText.isNotBlank() }
-                        "$total groups translated ($doneCount via ${curr.m5EngineType}, ${curr.m5DurationMs}ms)"
+                        "$total groups translated ($doneCount via ${curr.m5EngineType}, ${formatSeconds(curr.m5DurationMs)})"
+                    }
+                    DebugModule.MODULE_6_TYPESET -> {
+                        val blocksCount = curr.m6TypesetBlocks.size
+                        val linesCount = curr.m6TypesetBlocks.sumOf { it.lines.size }
+                        "$blocksCount blocks ($linesCount chord lines, inpaint: ${formatSeconds(curr.m6InpaintDurationMs)}, typeset: ${formatSeconds(curr.m6TypesetDurationMs)})"
+                    }
+                    DebugModule.FINAL_OUTPUT -> {
+                        val blocksCount = curr.m6TypesetBlocks.size
+                        "Final translated page ready ($blocksCount dialogue blocks typeset, Total: ${formatSeconds(curr.totalDurationMs)})"
                     }
                 }
-                statusMessage = "✓ ${targetModule.shortName} complete! ($countMsg)"
+                statusMessage = "✓ ${finalTarget.shortName} complete! ($countMsg)"
 
-                // Auto-export full telemetry JSON & step images to /sdcard/Download/CrunchLab/
+                // Dismiss processing spinner immediately so the UI is responsive without any hang!
+                isProcessing = false
+                pipelineJob = null
+
+                // Auto-export full telemetry JSON & step images to /sdcard/Download/CrunchLab/ in background coroutine
                 val pageToExport = curr
-                withContext(Dispatchers.IO) {
+                scope.launch(Dispatchers.IO) {
                     CrunchExporter.exportPage(context, pageToExport)
                 }
+            } catch (e: CancellationException) {
+                statusMessage = "⏹ ${targetModule.shortName} stopped by user"
+                Log.i("CrunchLab", "Process stopped by user")
             } catch (e: Exception) {
                 statusMessage = "Error in ${targetModule.shortName}: ${e.message}"
                 Log.e("CrunchLab", "Execution error", e)
             } finally {
                 isProcessing = false
+                pipelineJob = null
+                scheduleAutoCleanup()
+            }
+        }
+    }
+
+    suspend fun executeSinglePagePipeline(
+        currPage: ProcessedPage,
+        pagePrefix: String = ""
+    ): ProcessedPage {
+        var curr = currPage
+        val bmp = curr.sourceBitmap
+
+        // ─── Module 1: ComicTextDetector ───
+        coroutineContext.ensureActive()
+        statusMessage = "${pagePrefix}[M1] Detecting text lines & continuous heatmap..."
+        val tM1 = System.currentTimeMillis()
+        val resM1 = withContext(Dispatchers.Default) {
+            ctdEngine.runModule1(bmp) { msg ->
+                statusMessage = "$pagePrefix$msg"
+            }
+        }
+        val m1Time = System.currentTimeMillis() - tM1
+        curr = curr.copy(
+            m1TextProb = resM1.probMap,
+            m1Lines = resM1.lines,
+            m1Bubbles = resM1.bubbles,
+            m1Pass2Boxes = resM1.pass2Boxes,
+            m1Pass2Bitmap = resM1.pass2Bitmap,
+            m1Pass2PassedBoxes = resM1.pass2PassedBoxes,
+            m1Pass2RejectedBoxes = resM1.pass2RejectedBoxes,
+            m1Pass2Texts = resM1.pass2BoxTexts,
+            m1HeatmapBitmap = null,
+            m1DurationMs = m1Time
+        )
+
+        // ─── Module 1.5: Bubble Segmentation & Categorization ───
+        coroutineContext.ensureActive()
+        val tM1_5 = System.currentTimeMillis()
+        statusMessage = "${pagePrefix}[M1.5] Bubble segmentation..."
+        val rawMasks = withContext(Dispatchers.Default) {
+            segEngine.detectMasks(bmp)
+        }
+        statusMessage = "${pagePrefix}[M1.5] Pre-partitioning conjoined lobes..."
+        val (partitionedMasks, partitionedBubbles, partitions) = withContext(Dispatchers.Default) {
+            method3WaistEngine.partitionConjoinedBubbles(bmp, rawMasks, curr.m1Bubbles)
+        }
+        statusMessage = "${pagePrefix}[M1.5] Categorizing character boxes..."
+        val realBubbleRects = when {
+            partitionedBubbles.isNotEmpty() -> partitionedBubbles
+            partitionedMasks.isNotEmpty() -> partitionedMasks.map { it.rect }
+            else -> emptyList()
+        }
+        val catRes = withContext(Dispatchers.Default) {
+            TextCategorizer.categorizeBoxes(
+                rawBoxes = curr.m1Lines.map { it.rect },
+                bubbleRegions = realBubbleRects,
+                bubbleMasks = partitionedMasks,
+                ctdBubbles = curr.m1Bubbles,
+                bitmap = bmp,
+                bitmapWidth = bmp.width,
+                bitmapHeight = bmp.height,
+                isRtl = true
+            )
+        }
+        val m1_5Time = System.currentTimeMillis() - tM1_5
+        curr = curr.copy(
+            detectedMasks = partitionedMasks,
+            m2ConjoinedSplitBubbles = partitionedBubbles,
+            m3Partitions = partitions,
+            m1_5CategorizedBoxes = catRes.allBoxes,
+            m1_5BubbledCount = catRes.bubbledBoxes.size,
+            m1_5OrphanCount = catRes.orphanBoxes.size,
+            m1_5SfxCount = catRes.sfxBoxes.size,
+            m1_5DurationMs = m1_5Time
+        )
+
+        // ─── Module 2: Vertical Line Stitching ───
+        coroutineContext.ensureActive()
+        val tM2 = System.currentTimeMillis()
+        statusMessage = "${pagePrefix}[M2] Stitching single vertical lines..."
+        val rawBoxes = curr.m1_5CategorizedBoxes.ifEmpty {
+            curr.m1Lines.map { it.copy(category = TextCategory.BUBBLED) }
+        }
+        val bubbleRegions = when {
+            curr.m2ConjoinedSplitBubbles.isNotEmpty() -> curr.m2ConjoinedSplitBubbles
+            curr.detectedMasks.isNotEmpty() -> curr.detectedMasks.map { it.rect }
+            else -> emptyList()
+        }
+        val stitchedOut = withContext(Dispatchers.Default) {
+            VerticalLineStitcher.stitchLines(
+                categorizedBoxes = rawBoxes,
+                bubbleRegions = bubbleRegions,
+                bubbleMasks = curr.detectedMasks,
+                bitmap = bmp,
+                bitmapWidth = bmp.width,
+                bitmapHeight = bmp.height,
+                isRtl = true
+            )
+        }
+        val updatedPartitions = if (curr.m3Partitions.isNotEmpty()) {
+            method3WaistEngine.assignPartitionLines(curr.m3Partitions, stitchedOut.allLines)
+        } else emptyList()
+        val m2Time = System.currentTimeMillis() - tM2
+        curr = curr.copy(
+            m2VerticalLines = stitchedOut.allLines,
+            m2SuppressedFuriganaCount = stitchedOut.suppressedFuriganaCount,
+            m3Partitions = if (updatedPartitions.isNotEmpty()) updatedPartitions else curr.m3Partitions,
+            m2DurationMs = m2Time
+        )
+
+        // ─── Module 3: Waist Crunch & Lobe Partitioning ───
+        coroutineContext.ensureActive()
+        val tM3 = System.currentTimeMillis()
+        statusMessage = "${pagePrefix}[M3] Assigning vertical lines to lobes..."
+        val finalPartitions = withContext(Dispatchers.Default) {
+            method3WaistEngine.assignPartitionLines(
+                curr.m3Partitions,
+                curr.m2VerticalLines.ifEmpty { curr.m1Lines }
+            )
+        }
+        val isolated = withContext(Dispatchers.Default) {
+            IsolatedBubbleRenderer.renderIsolatedBubbles(bmp, curr.detectedMasks)
+        } ?: bmp
+        val m3Time = System.currentTimeMillis() - tM3
+        curr = curr.copy(
+            isolatedBitmap = isolated,
+            m3Partitions = finalPartitions,
+            m3DurationMs = m3Time
+        )
+
+        // ─── Module 4: Dialogue Data Preparation & MangaOCR ───
+        coroutineContext.ensureActive()
+        statusMessage = "${pagePrefix}[M4.1] Preparing dialogue groups..."
+        val tM4Prep = System.currentTimeMillis()
+        val groups = withContext(Dispatchers.Default) {
+            DialogueGroupPreparer.prepareGroups(
+                verticalLines = curr.m2VerticalLines.ifEmpty { curr.m1Lines },
+                bubbleRegions = when {
+                    curr.m2ConjoinedSplitBubbles.isNotEmpty() -> curr.m2ConjoinedSplitBubbles
+                    curr.detectedMasks.isNotEmpty() -> curr.detectedMasks.map { it.rect }
+                    else -> emptyList()
+                },
+                bubbleMasks = curr.detectedMasks,
+                partitions = curr.m3Partitions,
+                bitmapWidth = bmp.width,
+                bitmapHeight = bmp.height,
+                isRtl = true
+            )
+        }
+        val prepTime = System.currentTimeMillis() - tM4Prep
+
+        val totalLinesToOcr = groups.sumOf { it.lines.size }
+        statusMessage = "${pagePrefix}[M4.2] OCR on $totalLinesToOcr lines across ${groups.size} groups..."
+        val ocrRes = withContext(Dispatchers.Default) {
+            mangaOcrEngine.executeDialogueOcr(
+                bitmap = bmp,
+                groups = groups
+            ) { done, totalLines, text ->
+                statusMessage = "${pagePrefix}[M4.2] OCR ($done/$totalLines): 「${text.take(12)}...」"
+            }
+        }
+        curr = curr.copy(
+            m4DialogueGroups = ocrRes.updatedGroups,
+            m4OcrBlocks = ocrRes.blocks,
+            m4OcrCrops = ocrRes.crops,
+            m4PrepDurationMs = prepTime,
+            m4OcrDurationMs = ocrRes.durationMs
+        )
+
+        // ─── Module 5: Translation Batch ───
+        coroutineContext.ensureActive()
+        val inputGroups = curr.m4DialogueGroups
+        if (inputGroups.isNotEmpty()) {
+            val translator: TextTranslator = when (selectedEngine) {
+                TranslationEngineType.GOOGLE -> googleTranslator
+                TranslationEngineType.MLKIT -> mlkitTranslator
+                TranslationEngineType.SUGOI -> {
+                    sugoiTranslator.beamWidth = sugoiBeamWidth
+                    sugoiTranslator
+                }
+            }
+            val engineLabel = when (selectedEngine) {
+                TranslationEngineType.GOOGLE -> "Google Translate"
+                TranslationEngineType.MLKIT -> "Google ML Kit"
+                TranslationEngineType.SUGOI -> if (sugoiBeamWidth <= 1) "Sugoi V4 ONNX (⚡ Fast)" else "Sugoi V4 ONNX (✨ Quality)"
+            }
+            statusMessage = "${pagePrefix}[M5] Translating ${inputGroups.size} groups with $engineLabel..."
+            val tM5 = System.currentTimeMillis()
+            val textsToTranslate = inputGroups.map { it.recognizedText }
+            val translatedTexts = withContext(Dispatchers.Default) {
+                translator.translateBatch(textsToTranslate) { done, totalGroups ->
+                    statusMessage = "${pagePrefix}[M5] Translating ($done/$totalGroups) with $engineLabel..."
+                }
+            }
+            val m5Time = System.currentTimeMillis() - tM5
+            val translatedGroups = inputGroups.mapIndexed { idx, grp ->
+                grp.copy(
+                    translatedText = translatedTexts.getOrElse(idx) { "" },
+                    translationEngine = engineLabel
+                )
+            }
+            curr = curr.copy(
+                m5TranslatedGroups = translatedGroups,
+                m5EngineType = engineLabel,
+                m5DurationMs = m5Time
+            )
+        }
+
+        // ─── Module 6: Clean Canvas Inpaint & Dynamic Chord Typesetting ───
+        coroutineContext.ensureActive()
+        val typesetGroups = curr.m5TranslatedGroups.ifEmpty { curr.m4DialogueGroups }
+        if (typesetGroups.isNotEmpty()) {
+            statusMessage = "${pagePrefix}[M6.1] Clean canvas inpainting..."
+            val tM6Inpaint = System.currentTimeMillis()
+            val cleanBmp = withContext(Dispatchers.Default) {
+                MangaInpainter.inpaintCleanCanvas(
+                    original = bmp,
+                    groups = typesetGroups,
+                    heatmap = curr.m1TextProb
+                )
+            }
+            val inpaintTime = System.currentTimeMillis() - tM6Inpaint
+
+            coroutineContext.ensureActive()
+            statusMessage = "${pagePrefix}[M6.2] Typesetting dialogue chord lines..."
+            val typesetRes = withContext(Dispatchers.Default) {
+                DynamicChordTypesetter.typesetDialogue(
+                    cleanBitmap = cleanBmp,
+                    groups = typesetGroups
+                )
+            }
+            curr = curr.copy(
+                m6CleanBitmap = cleanBmp,
+                m6InpaintDurationMs = inpaintTime,
+                m6TypesetBlocks = typesetRes.blocks,
+                m6FinalBitmap = typesetRes.outputBitmap,
+                m6TypesetDurationMs = typesetRes.durationMs
+            )
+        }
+
+        return curr
+    }
+
+    fun startCbzBatchTranslation(
+        items: List<Pair<String, Bitmap>>,
+        sourceFile: File,
+        metadata: CrunchExporter.CbzArchiveMetadata? = null,
+        targetIndices: List<Int>? = null
+    ) {
+        if (items.isEmpty()) return
+        cleanupJob?.cancel()
+        pipelineJob?.cancel()
+        pipelineJob = scope.launch {
+            isProcessing = true
+            try {
+                coroutineContext.ensureActive()
+                statusMessage = "Starting batch translation for ${items.size} pages from ${sourceFile.name}..."
+                scale = 1f
+                offset = Offset.Zero
+                spotlightRect = null
+                inspectedBoxInfo = null
+                activeModule = DebugModule.FINAL_OUTPUT
+                m6SubStep = M6SubStep.TYPESET_OUTPUT
+                compareWithOriginal = false
+
+                processedPages = items.mapIndexed { idx, (label, bmp) ->
+                    ProcessedPage(
+                        index = idx,
+                        label = label,
+                        sourceBitmap = bmp,
+                        isolatedBitmap = bmp
+                    )
+                }
+                activePageIndex = 0
+
+                // Upfront Model Verification
+                if (!downloader.isComicTextModelReady()) {
+                    statusMessage = "ComicText model missing. Please click Get Models."
+                    isProcessing = false
+                    return@launch
+                }
+                if (!downloader.isBubbleModelReady() || !downloader.isWaistModelReady()) {
+                    statusMessage = "BubbleSeg or Waist model missing (place manga_waist_model.onnx in Download)."
+                    isProcessing = false
+                    return@launch
+                }
+                if (!downloader.isMangaOcrReady()) {
+                    statusMessage = "MangaOCR models missing. Please click Get MangaOCR."
+                    isProcessing = false
+                    return@launch
+                }
+                if (selectedEngine == TranslationEngineType.SUGOI && !downloader.isSugoiReady()) {
+                    statusMessage = "Sugoi ONNX missing. Place encoder, decoder & sugoi_vocab.json in Download/sugoi."
+                    isProcessing = false
+                    return@launch
+                }
+
+                val total = items.size
+                val translatedMap = mutableMapOf<Int, Bitmap>()
+
+                for (pageIdx in 0 until total) {
+                    coroutineContext.ensureActive()
+                    activePageIndex = pageIdx
+                    var curr = processedPages[pageIdx]
+                    val pagePrefix = "[CBZ ${pageIdx + 1}/$total] "
+
+                    curr = executeSinglePagePipeline(
+                        currPage = curr,
+                        pagePrefix = pagePrefix
+                    )
+
+                    val updatedList = processedPages.toMutableList()
+                    updatedList[pageIdx] = curr
+                    processedPages = updatedList
+
+                    val finalBmp = curr.m6FinalBitmap ?: curr.sourceBitmap
+                    val origArchiveIdx = targetIndices?.getOrNull(pageIdx) ?: pageIdx
+                    translatedMap[origArchiveIdx] = finalBmp
+                }
+
+                // Export to Komikku Local Source
+                statusMessage = "[CBZ] Exporting $total pages to Komikku Local Source..."
+                val resolvedMetadata = metadata ?: withContext(Dispatchers.IO) {
+                    CrunchExporter.extractCbzMetadata(sourceFile)
+                }
+
+                val exportResult = withContext(Dispatchers.IO) {
+                    CrunchExporter.exportToLocalSource(resolvedMetadata, translatedMap) { done, count ->
+                        statusMessage = "[CBZ] Packing into Local Source ($done/$count): ${sourceFile.name}"
+                    }
+                }
+
+                if (exportResult.success) {
+                    val sizeMb = String.format(Locale.US, "%.1f", exportResult.cbzFile.length() / (1024f * 1024f))
+                    statusMessage = "✓ Exported to Local Source: ${exportResult.mangaDir.name}/${exportResult.cbzFile.name} (${sizeMb}MB)"
+                } else {
+                    statusMessage = "⚠ Export to Local Source failed: ${exportResult.errorMessage}"
+                }
+
+            } catch (e: CancellationException) {
+                statusMessage = "⏹ CBZ translation stopped by user at page ${activePageIndex + 1}/${items.size}"
+                Log.i("CrunchLab", "CBZ translation cancelled by user")
+            } catch (e: Exception) {
+                statusMessage = "Error during CBZ batch translation: ${e.message}"
+                Log.e("CrunchLab", "CBZ batch translation failed", e)
+            } finally {
+                isProcessing = false
+                pipelineJob = null
                 scheduleAutoCleanup()
             }
         }
@@ -619,30 +1288,43 @@ fun CrunchLabScreen() {
 
     fun loadPagesFromBitmaps(items: List<Pair<String, Bitmap>>) {
         if (items.isEmpty()) return
-        scope.launch {
+        cleanupJob?.cancel()
+        pipelineJob?.cancel()
+        pipelineJob = scope.launch {
             isProcessing = true
-            statusMessage = "Loading ${items.size} pages..."
-            scale = 1f
-            offset = Offset.Zero
-            spotlightRect = null
-            inspectedBoxInfo = null
-            activeModule = DebugModule.MODULE_1_CTD
-            m1SubStep = M1SubStep.LINE_BOXES
-            m1_5SubStep = M1_5SubStep.ALL
-            m2SubStep = M2SubStep.ALL_LINES
-            m3SubStep = M3SubStep.LOBE_PARTITION
-            m4SubStep = M4SubStep.DATA_PREPARE
-            processedPages = items.mapIndexed { idx, (label, bmp) ->
-                ProcessedPage(
-                    index = idx,
-                    label = label,
-                    sourceBitmap = bmp,
-                    isolatedBitmap = bmp
-                )
+            try {
+                coroutineContext.ensureActive()
+                statusMessage = "Loading ${items.size} pages..."
+                scale = 1f
+                offset = Offset.Zero
+                spotlightRect = null
+                inspectedBoxInfo = null
+                activeModule = DebugModule.MODULE_1_CTD
+                m1SubStep = M1SubStep.LINE_BOXES
+                m1_5SubStep = M1_5SubStep.ALL
+                m2SubStep = M2SubStep.ALL_LINES
+                m3SubStep = M3SubStep.LOBE_PARTITION
+                m4SubStep = M4SubStep.DATA_PREPARE
+                m6SubStep = M6SubStep.TYPESET_OUTPUT
+                compareWithOriginal = false
+                processedPages = items.mapIndexed { idx, (label, bmp) ->
+                    ProcessedPage(
+                        index = idx,
+                        label = label,
+                        sourceBitmap = bmp,
+                        isolatedBitmap = bmp
+                    )
+                }
+                activePageIndex = 0
+                statusMessage = "Loaded ${items.size} pages. Ready to run M1, M2, or M3."
+            } catch (e: CancellationException) {
+                statusMessage = "⏹ Loading cancelled"
+            } catch (e: Exception) {
+                statusMessage = "Error loading pages: ${e.message}"
+            } finally {
+                isProcessing = false
+                pipelineJob = null
             }
-            activePageIndex = 0
-            isProcessing = false
-            statusMessage = "Loaded ${items.size} pages. Ready to run M1, M2, or M3."
         }
     }
 
@@ -805,13 +1487,24 @@ fun CrunchLabScreen() {
                                             .clickable {
                                                 spotlightRect = item.rect
                                                 val grp = activePage.m4DialogueGroups.firstOrNull { it.groupId == item.groupId }
+                                                val badge = if (item.readingOrder != null) "#G${item.groupId}.${item.readingOrder}" else "#G${item.groupId}"
+                                                val sub = if (item.readingOrder != null) {
+                                                    "Col ${item.readingOrder}/${grp?.lines?.size ?: 1} in Group #${item.groupId} (${if (item.isBubble) "Bubble" else "Orphan"})"
+                                                } else {
+                                                    "${item.rect.width()} × ${item.rect.height()} px"
+                                                }
+                                                val textDisplay = if (item.rawText.isNotBlank()) {
+                                                    "Line: 「${item.rawText}」\nGroup: 「${grp?.recognizedText}」"
+                                                } else {
+                                                    grp?.recognizedText?.ifBlank { null }
+                                                }
                                                 inspectedBoxInfo = BoxInspectionInfo(
-                                                    badgeNumber = "#G${item.groupId}",
-                                                    title = if (item.isBubble) "Bubbled Dialogue Crop" else "Orphan Dialogue Crop",
-                                                    subtitle = "${item.rect.width()} × ${item.rect.height()} px",
+                                                    badgeNumber = badge,
+                                                    title = if (item.isBubble) "Bubbled Line Crop" else "Orphan Line Crop",
+                                                    subtitle = sub,
                                                     dimensions = "${item.rect.width()} × ${item.rect.height()} px",
-                                                    recognizedText = item.rawText.ifBlank { grp?.recognizedText },
-                                                    confidence = "MangaOCR Recognition",
+                                                    recognizedText = textDisplay,
+                                                    confidence = "MangaOCR Line #${item.lineId ?: item.index}",
                                                     tagColor = if (item.isBubble) Color(0xFF00E676) else Color(0xFFFFD600),
                                                     rect = item.rect
                                                 )
@@ -837,8 +1530,9 @@ fun CrunchLabScreen() {
                                                 modifier = Modifier.widthIn(max = 140.dp),
                                                 verticalArrangement = Arrangement.Center
                                             ) {
+                                                val badgeText = if (item.readingOrder != null) "#G${item.groupId}.${item.readingOrder}" else "#G${item.groupId}"
                                                 Text(
-                                                    "#G${item.groupId} ${if (item.isBubble) "⚪" else "🏷️"}",
+                                                    "$badgeText ${if (item.isBubble) "⚪" else "🏷️"}",
                                                     color = Color.White,
                                                     fontSize = 10.sp,
                                                     fontWeight = FontWeight.Bold
@@ -1036,6 +1730,157 @@ fun CrunchLabScreen() {
                         }
                     }
                 }
+            } else if (activeModule == DebugModule.MODULE_6_TYPESET && activePage?.m6TypesetBlocks?.isNotEmpty() == true) {
+                Surface(
+                    color = Color(0xFF1B1B1B),
+                    tonalElevation = 4.dp,
+                    shadowElevation = 4.dp
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        val groupColors = listOf(
+                            Color(0xFF00E5FF),
+                            Color(0xFFFFD600),
+                            Color(0xFFFF4081),
+                            Color(0xFF76FF03),
+                            Color(0xFFFF9100),
+                            Color(0xFFE040FB),
+                            Color(0xFF00E676),
+                            Color(0xFF40C4FF),
+                        )
+
+                        LazyRow(
+                            state = bubbleListState,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth().height(68.dp)
+                        ) {
+                            itemsIndexed(activePage.m6TypesetBlocks) { _, item ->
+                                val isSelected = spotlightRect == item.bounds
+                                val grpColor = groupColors[(item.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                val bg = if (isSelected) Color(0xFF0091EA) else Color(0xFF212121)
+
+                                Surface(
+                                    color = bg,
+                                    shape = RoundedCornerShape(6.dp),
+                                    border = if (isSelected) BorderStroke(1.5.dp, Color(0xFF00E5FF)) else BorderStroke(1.dp, grpColor.copy(alpha = 0.5f)),
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .clickable {
+                                            spotlightRect = item.bounds
+                                            val minScaleX = item.lines.minOfOrNull { it.scaleX } ?: 1.0f
+                                            inspectedBoxInfo = BoxInspectionInfo(
+                                                badgeNumber = "#T${item.groupId}",
+                                                title = if (item.isBubble) "Bubbled Typeset Block" else "Orphan Typeset Block",
+                                                subtitle = "${item.fontSize.toInt()}sp font · ${item.lines.size} chord lines · scaleX=${String.format(Locale.US, "%.2f", minScaleX)}",
+                                                dimensions = "${item.bounds.width()} × ${item.bounds.height()} px",
+                                                recognizedText = item.originalJapanese.ifBlank { null },
+                                                translatedText = item.translatedEnglish.ifBlank { null },
+                                                confidence = "Module 6 Dynamic Typesetting",
+                                                tagColor = grpColor,
+                                                rect = item.bounds
+                                            )
+                                        }
+                                ) {
+                                    val blockScaleX = item.lines.minOfOrNull { it.scaleX } ?: 1.0f
+                                    Column(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Text(
+                                                "#T${item.groupId} ${if (item.isBubble) "⚪" else "🏷️"}",
+                                                color = grpColor,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                "${item.fontSize.toInt()}sp (${item.lines.size}L)",
+                                                color = Color.LightGray,
+                                                fontSize = 8.sp
+                                            )
+                                        }
+                                        if (item.translatedEnglish.isNotBlank()) {
+                                            Text(
+                                                "\"${item.translatedEnglish}\"",
+                                                color = Color.White,
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        Text(
+                                            "${item.bounds.width()}×${item.bounds.height()} · scaleX=${String.format(Locale.US, "%.2f", blockScaleX)}",
+                                            color = Color.Gray,
+                                            fontSize = 8.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (activeModule == DebugModule.FINAL_OUTPUT) {
+                val page = activePage
+                val m1Ms = page?.m1DurationMs ?: 0L
+                val m1_5Ms = page?.m1_5DurationMs ?: 0L
+                val m2Ms = page?.m2DurationMs ?: 0L
+                val m3Ms = page?.m3DurationMs ?: 0L
+                val m4Ms = (page?.m4PrepDurationMs ?: 0L) + (page?.m4OcrDurationMs ?: 0L)
+                val m5Ms = page?.m5DurationMs ?: 0L
+                val m6Ms = (page?.m6InpaintDurationMs ?: 0L) + (page?.m6TypesetDurationMs ?: 0L)
+                val totalMs = page?.totalDurationMs ?: (m1Ms + m1_5Ms + m2Ms + m3Ms + m4Ms + m5Ms + m6Ms)
+
+                Surface(
+                    color = Color(0xFF141414),
+                    tonalElevation = 4.dp,
+                    shadowElevation = 4.dp
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Surface(
+                            color = Color(0xFF00E5FF),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "⚡ Total: ",
+                                    color = Color.Black,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    formatSeconds(totalMs),
+                                    color = Color.Black,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                        }
+
+                        TimingModuleChip("M1", formatSeconds(m1Ms), Color(0xFFFF9800))
+                        TimingModuleChip("M1.5", formatSeconds(m1_5Ms), Color(0xFF00E676))
+                        TimingModuleChip("M2", formatSeconds(m2Ms), Color(0xFF9C27B0))
+                        TimingModuleChip("M3", formatSeconds(m3Ms), Color(0xFF00B0FF))
+                        TimingModuleChip("M4", formatSeconds(m4Ms), Color(0xFFFFD600))
+                        TimingModuleChip("M5", formatSeconds(m5Ms), Color(0xFF00E5FF))
+                        TimingModuleChip("M6", formatSeconds(m6Ms), Color(0xFFFF4081))
+                    }
+                }
             }
         },
         bottomBar = {
@@ -1093,6 +1938,8 @@ fun CrunchLabScreen() {
                                         )
                                         Spacer(modifier = Modifier.width(4.dp))
                                         val statusBadge = when {
+                                            page.m6FinalBitmap != null -> "✨ Final"
+                                            page.m5TranslatedGroups.isNotEmpty() -> "🌐 ${page.m5TranslatedGroups.size}"
                                             page.m4DialogueGroups.isNotEmpty() -> "📖 ${page.m4DialogueGroups.size}"
                                             page.m3Partitions.isNotEmpty() -> "✂️ $m3Crunched"
                                             page.m2VerticalLines.isNotEmpty() -> "📑 $m2Count"
@@ -1116,6 +1963,74 @@ fun CrunchLabScreen() {
                         horizontalArrangement = Arrangement.spacedBy(5.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // 1. Run Upto (from beginning up to activeModule)
+                        Surface(
+                            color = if (isProcessing) Color.Gray else Color(0xFF6A1B9A),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.clickable(enabled = !isProcessing && activePage != null) {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                runModule(activeModule, ModuleRunMode.RUN_UPTO)
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.FastRewind, contentDescription = null, tint = Color.White, modifier = Modifier.size(11.dp))
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text("Run Upto ${activeModule.shortTag}", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // 2. Run (this module only, taking previous output and stopping)
+                        Surface(
+                            color = if (isProcessing) Color.Gray else Color(0xFF00C853),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.clickable(enabled = !isProcessing && activePage != null) {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                runModule(activeModule, ModuleRunMode.RUN_CURRENT)
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = Color.White, modifier = Modifier.size(11.dp))
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text("Run ${activeModule.shortTag}", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // 3. Run to End (from this module all the way to Final)
+                        Surface(
+                            color = if (isProcessing) Color.Gray else Color(0xFFFF6D00),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.clickable(enabled = !isProcessing && activePage != null) {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                runModule(activeModule, ModuleRunMode.RUN_TO_END)
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.FastForward, contentDescription = null, tint = Color.White, modifier = Modifier.size(11.dp))
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text("${activeModule.shortTag} to End", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // Subtle Divider
+                        Box(
+                            modifier = Modifier
+                                .height(16.dp)
+                                .width(1.dp)
+                                .background(Color(0xFF555555))
+                        )
+
                         when (activeModule) {
                             DebugModule.MODULE_1_CTD -> {
                                 M1SubStep.entries.forEach { step ->
@@ -1277,20 +2192,19 @@ fun CrunchLabScreen() {
                                 }
 
                                 if (selectedEngine == TranslationEngineType.SUGOI) {
-                                    val isBeam1 = sugoiBeamWidth <= 1
                                     Surface(
-                                        color = if (isBeam1) Color(0xFF673AB7) else Color(0xFF2A2A2A),
+                                        color = if (sugoiBeamWidth <= 1) Color(0xFF673AB7) else Color(0xFF2A2A2A),
                                         shape = RoundedCornerShape(6.dp),
                                         modifier = Modifier.clickable { sugoiBeamWidth = 1 }
                                     ) {
-                                        Text("Beam 1 (Fast)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
+                                        Text("⚡ Fast", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
                                     }
                                     Surface(
-                                        color = if (!isBeam1) Color(0xFF673AB7) else Color(0xFF2A2A2A),
+                                        color = if (sugoiBeamWidth >= 2) Color(0xFF673AB7) else Color(0xFF2A2A2A),
                                         shape = RoundedCornerShape(6.dp),
-                                        modifier = Modifier.clickable { sugoiBeamWidth = 3 }
+                                        modifier = Modifier.clickable { sugoiBeamWidth = 2 }
                                     ) {
-                                        Text("Beam 3 (Accurate)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
+                                        Text("✨ Quality", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
                                     }
                                 }
 
@@ -1306,9 +2220,80 @@ fun CrunchLabScreen() {
                                     }
                                     if ((activePage?.m5DurationMs ?: 0L) > 0L) {
                                         Surface(color = Color(0xFF1E88E5), shape = RoundedCornerShape(4.dp)) {
-                                            Text("${activePage?.m5DurationMs}ms", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                            Text(formatSeconds(activePage?.m5DurationMs ?: 0L), color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
                                         }
                                     }
+                                }
+                            }
+                            DebugModule.MODULE_6_TYPESET -> {
+                                M6SubStep.entries.forEach { step ->
+                                    val isSel = m6SubStep == step
+                                    Surface(
+                                        color = if (isSel) Color(0xFF00E5FF) else Color(0xFF2A2A2A),
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = if (isSel) null else BorderStroke(1.dp, Color(0xFF444444)),
+                                        modifier = Modifier.clickable { m6SubStep = step }
+                                    ) {
+                                        Text(
+                                            step.label,
+                                            color = if (isSel) Color.Black else Color.LightGray,
+                                            fontSize = 10.sp,
+                                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+
+                                val blockCount = activePage?.m6TypesetBlocks?.size ?: 0
+                                val inpaintMs = activePage?.m6InpaintDurationMs ?: 0L
+                                val typesetMs = activePage?.m6TypesetDurationMs ?: 0L
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(start = 4.dp)
+                                ) {
+                                    Surface(color = Color(0xFF00E676), shape = RoundedCornerShape(4.dp)) {
+                                        Text("Blocks ($blockCount)", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                    }
+                                    if (inpaintMs > 0L) {
+                                        Surface(color = Color(0xFF1E88E5), shape = RoundedCornerShape(4.dp)) {
+                                            Text("${formatSeconds(inpaintMs)} clean", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                        }
+                                    }
+                                    if (typesetMs > 0L) {
+                                        Surface(color = Color(0xFF8E24AA), shape = RoundedCornerShape(4.dp)) {
+                                            Text("${formatSeconds(typesetMs)} typeset", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                        }
+                                    }
+                                }
+                            }
+                            DebugModule.FINAL_OUTPUT -> {
+                                Surface(
+                                    color = if (compareWithOriginal) Color(0xFFFF9100) else Color(0xFF2A2A2A),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.clickable {
+                                        compareWithOriginal = !compareWithOriginal
+                                        wipeCurtainFraction = if (compareWithOriginal) 0.0f else 1.0f
+                                    }
+                                ) {
+                                    Text(
+                                        if (compareWithOriginal) "Original Scan (Active)" else "Compare: Original vs Translated",
+                                        color = if (compareWithOriginal) Color.Black else Color.White,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+                                Surface(
+                                    color = Color(0xFF333333),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        "Curtain: ${(wipeCurtainFraction * 100).toInt()}%",
+                                        color = Color.LightGray,
+                                        fontSize = 9.sp,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                                    )
                                 }
                             }
                         }
@@ -1340,6 +2325,29 @@ fun CrunchLabScreen() {
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 5.dp, vertical = 4.dp)
+                            )
+                        }
+
+                        // ⚡ Profile Settings
+                        Surface(
+                            color = when (activeProfile) {
+                                ResourceProfile.LOW -> Color(0xFF00796B)
+                                ResourceProfile.MID -> Color(0xFF2E7D32)
+                                ResourceProfile.HIGH -> Color(0xFFC2185B)
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.clickable {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                showSettingsSheet = true
+                            }
+                        ) {
+                            Text(
+                                "⚡ ${activeProfile.badge}",
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
                             )
                         }
 
@@ -1392,6 +2400,8 @@ fun CrunchLabScreen() {
                                 DebugModule.MODULE_3_CRUNCH -> activePage?.m3Partitions?.isNotEmpty() == true
                                 DebugModule.MODULE_4_OCR -> activePage?.m4DialogueGroups?.isNotEmpty() == true
                                 DebugModule.MODULE_5_TRANSLATE -> activePage?.m5TranslatedGroups?.isNotEmpty() == true
+                                DebugModule.MODULE_6_TYPESET -> activePage?.m6FinalBitmap != null || activePage?.m6CleanBitmap != null
+                                DebugModule.FINAL_OUTPUT -> activePage?.m6FinalBitmap != null
                             }
                             val tabBg = when {
                                 isSelected -> Color(0xFF00E5FF)
@@ -1433,26 +2443,123 @@ fun CrunchLabScreen() {
 
                                     Spacer(modifier = Modifier.width(4.dp))
 
-                                    // Embedded mini play button to execute this specific module
-                                    Surface(
-                                        color = if (isProcessing) Color.Gray else if (isSelected) Color(0xFF0091EA) else Color(0xFFFF6D00),
-                                        shape = CircleShape,
-                                        modifier = Modifier
-                                            .size(18.dp)
-                                            .clickable(enabled = !isProcessing && processedPages.isNotEmpty()) {
-                                                focusManager.clearFocus()
-                                                keyboardController?.hide()
-                                                activeModule = mod
-                                                runModule(mod, forceUpstream = false)
+                                    // Action buttons for module
+                                    val isRunningThisMod = isProcessing && isSelected
+                                    if (isRunningThisMod) {
+                                        Surface(
+                                            color = Color(0xFFD32F2F),
+                                            shape = CircleShape,
+                                            modifier = Modifier
+                                                .size(18.dp)
+                                                .clickable {
+                                                    focusManager.clearFocus()
+                                                    keyboardController?.hide()
+                                                    stopProcessing()
+                                                }
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.Filled.Stop,
+                                                    contentDescription = "Stop ${mod.shortName}",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(10.dp)
+                                                )
                                             }
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                Icons.Filled.PlayArrow,
-                                                contentDescription = "Run ${mod.shortName}",
-                                                tint = Color.White,
-                                                modifier = Modifier.size(12.dp)
-                                            )
+                                        }
+                                    } else if (isSelected) {
+                                        // Selected module displays 3 mini action buttons:
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            // 1. Run Upto
+                                            Surface(
+                                                color = if (isProcessing) Color.Gray else Color(0xFF6A1B9A),
+                                                shape = CircleShape,
+                                                modifier = Modifier
+                                                    .size(18.dp)
+                                                    .clickable(enabled = !isProcessing && processedPages.isNotEmpty()) {
+                                                        focusManager.clearFocus()
+                                                        keyboardController?.hide()
+                                                        runModule(mod, ModuleRunMode.RUN_UPTO)
+                                                    }
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Icon(
+                                                        Icons.Filled.FastRewind,
+                                                        contentDescription = "Run Upto ${mod.shortName}",
+                                                        tint = Color.White,
+                                                        modifier = Modifier.size(11.dp)
+                                                    )
+                                                }
+                                            }
+
+                                            // 2. Run
+                                            Surface(
+                                                color = if (isProcessing) Color.Gray else Color(0xFF00C853),
+                                                shape = CircleShape,
+                                                modifier = Modifier
+                                                    .size(18.dp)
+                                                    .clickable(enabled = !isProcessing && processedPages.isNotEmpty()) {
+                                                        focusManager.clearFocus()
+                                                        keyboardController?.hide()
+                                                        runModule(mod, ModuleRunMode.RUN_CURRENT)
+                                                    }
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Icon(
+                                                        Icons.Filled.PlayArrow,
+                                                        contentDescription = "Run ${mod.shortName}",
+                                                        tint = Color.White,
+                                                        modifier = Modifier.size(11.dp)
+                                                    )
+                                                }
+                                            }
+
+                                            // 3. Run to End
+                                            Surface(
+                                                color = if (isProcessing) Color.Gray else Color(0xFFFF6D00),
+                                                shape = CircleShape,
+                                                modifier = Modifier
+                                                    .size(18.dp)
+                                                    .clickable(enabled = !isProcessing && processedPages.isNotEmpty()) {
+                                                        focusManager.clearFocus()
+                                                        keyboardController?.hide()
+                                                        runModule(mod, ModuleRunMode.RUN_TO_END)
+                                                    }
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Icon(
+                                                        Icons.Filled.FastForward,
+                                                        contentDescription = "${mod.shortName} to End",
+                                                        tint = Color.White,
+                                                        modifier = Modifier.size(11.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // Unselected tab displays single play button
+                                        Surface(
+                                            color = if (isProcessing) Color.Gray else Color(0xFFFF6D00),
+                                            shape = CircleShape,
+                                            modifier = Modifier
+                                                .size(18.dp)
+                                                .clickable(enabled = !isProcessing && processedPages.isNotEmpty()) {
+                                                    focusManager.clearFocus()
+                                                    keyboardController?.hide()
+                                                    activeModule = mod
+                                                    runModule(mod, ModuleRunMode.RUN_CURRENT)
+                                                }
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.Filled.PlayArrow,
+                                                    contentDescription = "Run ${mod.shortName}",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(11.dp)
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -1460,28 +2567,30 @@ fun CrunchLabScreen() {
                         }
 
                         if (processedPages.isNotEmpty()) {
-                            // ⏩ RUN BEFORE BUTTON (M1 -> activeModule)
-                            Surface(
-                                color = if (isProcessing) Color.Gray else Color(0xFFD500F9),
-                                shape = RoundedCornerShape(6.dp),
-                                modifier = Modifier.clickable(enabled = !isProcessing) {
-                                    focusManager.clearFocus()
-                                    keyboardController?.hide()
-                                    runModule(activeModule, forceUpstream = true)
-                                }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                            if (isProcessing) {
+                                // ⏹ STOP PROCESS BUTTON
+                                Surface(
+                                    color = Color(0xFFD32F2F),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.clickable {
+                                        focusManager.clearFocus()
+                                        keyboardController?.hide()
+                                        stopProcessing()
+                                    }
                                 ) {
-                                    Icon(Icons.Filled.FastForward, contentDescription = null, tint = Color.White, modifier = Modifier.size(12.dp))
-                                    Spacer(modifier = Modifier.width(2.dp))
-                                    Text(
-                                        "Run Before",
-                                        color = Color.White,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Filled.Stop, contentDescription = "Stop Process", tint = Color.White, modifier = Modifier.size(12.dp))
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text(
+                                            "Stop",
+                                            color = Color.White,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
 
@@ -1654,6 +2763,35 @@ fun CrunchLabScreen() {
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
+                        if (isProcessing) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                color = Color(0xFFD32F2F),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.clickable {
+                                    stopProcessing()
+                                }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Stop,
+                                        contentDescription = "Stop",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(11.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text(
+                                        "STOP",
+                                        color = Color.White,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     // Download Progress Indicator
@@ -1794,14 +2932,19 @@ fun CrunchLabScreen() {
                                                             } else {
                                                                 "${hitGroup.lines.size} columns (${if (hitGroup.isBubble) "Bubble" else "Orphan"})"
                                                             }
+                                                            val textDisplay = if (hitLine != null && hitLine.recognizedText.isNotBlank()) {
+                                                                "Line #${hitLine.lineId}: 「${hitLine.recognizedText}」\nGroup: 「${hitGroup.recognizedText}」"
+                                                            } else {
+                                                                hitGroup.recognizedText.ifBlank { null }
+                                                            }
 
                                                             inspectedBoxInfo = BoxInspectionInfo(
                                                                 badgeNumber = badge,
-                                                                title = if (hitGroup.isBubble) "Bubbled Dialogue Unit" else "Orphan Dialogue Unit",
+                                                                title = if (hitGroup.isBubble) (if (hitLine != null) "Bubbled Vertical Line" else "Bubbled Dialogue Unit") else (if (hitLine != null) "Orphan Vertical Line" else "Orphan Dialogue Unit"),
                                                                 subtitle = sub,
                                                                 dimensions = "${(hitLine?.rect ?: hitGroup.bounds).width()} × ${(hitLine?.rect ?: hitGroup.bounds).height()} px",
-                                                                recognizedText = hitGroup.recognizedText.ifBlank { null },
-                                                                confidence = "Module 4 Dialogue Unit",
+                                                                recognizedText = textDisplay,
+                                                                confidence = if (hitLine != null) "MangaOCR Single Line #${hitLine.lineId}" else "Module 4 Dialogue Unit",
                                                                 tagColor = tagCol,
                                                                 rect = hitLine?.rect ?: hitGroup.bounds
                                                             )
@@ -1853,6 +2996,51 @@ fun CrunchLabScreen() {
                                                             val gIdx = groups.indexOf(hitGroup)
                                                             if (gIdx >= 0) {
                                                                 scope.launch { bubbleListState.animateScrollToItem(gIdx) }
+                                                            }
+                                                        } else {
+                                                            spotlightRect = null
+                                                            inspectedBoxInfo = null
+                                                        }
+                                                    }
+                                                    DebugModule.MODULE_6_TYPESET, DebugModule.FINAL_OUTPUT -> {
+                                                        val blocks = activePage?.m6TypesetBlocks ?: emptyList()
+                                                        val candidates = blocks.filter {
+                                                            val r = it.bounds
+                                                            bx in (r.left - 8)..(r.right + 8) && by in (r.top - 8)..(r.bottom + 8)
+                                                        }
+                                                        val hitBlock = candidates.minByOrNull {
+                                                            val dx = it.bounds.centerX() - bx
+                                                            val dy = it.bounds.centerY() - by
+                                                            dx * dx + dy * dy
+                                                        }
+                                                        if (hitBlock != null) {
+                                                            spotlightRect = hitBlock.bounds
+                                                            val groupColors = listOf(
+                                                                Color(0xFF00E5FF),
+                                                                Color(0xFFFFD600),
+                                                                Color(0xFFFF4081),
+                                                                Color(0xFF76FF03),
+                                                                Color(0xFFFF9100),
+                                                                Color(0xFFE040FB),
+                                                                Color(0xFF00E676),
+                                                                Color(0xFF40C4FF),
+                                                            )
+                                                            val tagCol = groupColors[(hitBlock.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                                            val minScaleX = hitBlock.lines.minOfOrNull { it.scaleX } ?: 1.0f
+                                                            inspectedBoxInfo = BoxInspectionInfo(
+                                                                badgeNumber = "#T${hitBlock.groupId}",
+                                                                title = if (hitBlock.isBubble) "Bubbled Typeset Dialogue" else "Orphan Typeset Dialogue",
+                                                                subtitle = "${hitBlock.fontSize.toInt()}sp font · ${hitBlock.lines.size} chord lines · scaleX=${String.format(Locale.US, "%.2f", minScaleX)}",
+                                                                dimensions = "${hitBlock.bounds.width()} × ${hitBlock.bounds.height()} px",
+                                                                recognizedText = hitBlock.originalJapanese.ifBlank { null },
+                                                                translatedText = hitBlock.translatedEnglish.ifBlank { null },
+                                                                confidence = "Module 6 Dynamic Typesetting",
+                                                                tagColor = tagCol,
+                                                                rect = hitBlock.bounds
+                                                            )
+                                                            val bIdx = blocks.indexOf(hitBlock)
+                                                            if (bIdx >= 0) {
+                                                                scope.launch { bubbleListState.animateScrollToItem(bIdx) }
                                                             }
                                                         } else {
                                                             spotlightRect = null
@@ -2118,7 +3306,11 @@ fun CrunchLabScreen() {
                             val drawTop = (canvasH - drawH) / 2f
 
                             // Draw Base Manga Image
-                            val baseImageToDraw = displayBmp
+                            val baseImageToDraw = if (activeModule == DebugModule.FINAL_OUTPUT && activePage?.m6FinalBitmap != null) {
+                                activePage?.sourceBitmap ?: displayBmp
+                            } else {
+                                displayBmp
+                            }
 
                             if (!baseImageToDraw.isRecycled) {
                                 drawImage(
@@ -2612,6 +3804,51 @@ fun CrunchLabScreen() {
                                                         cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f),
                                                         style = Stroke(width = 2.2f)
                                                     )
+                                                    drawRoundRect(
+                                                        color = grpColor.copy(alpha = 0.05f),
+                                                        topLeft = Offset(cBounds.left, cBounds.top),
+                                                        size = Size(cBounds.width, cBounds.height),
+                                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f)
+                                                    )
+
+                                                    // Draw constituent single vertical line strips with RTL reading badges
+                                                    group.lines.forEach { line ->
+                                                        val lr = toCanvasRect(line.rect)
+                                                        drawRect(
+                                                            color = grpColor.copy(alpha = 0.7f),
+                                                            topLeft = Offset(lr.left, lr.top),
+                                                            size = Size(lr.width, lr.height),
+                                                            style = Stroke(width = 1.4f)
+                                                        )
+                                                        drawRect(
+                                                            color = grpColor.copy(alpha = 0.08f),
+                                                            topLeft = Offset(lr.left, lr.top),
+                                                            size = Size(lr.width, lr.height)
+                                                        )
+
+                                                        drawContext.canvas.nativeCanvas.apply {
+                                                            val badgeText = "#G${group.groupId}.${line.readingOrder}"
+                                                            val tPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = android.graphics.Color.BLACK
+                                                                textSize = 10f
+                                                                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                            }
+                                                            val tW = tPaint.measureText(badgeText)
+                                                            val bH = 13f
+                                                            val bW = tW + 4f
+                                                            val badgeLeft = lr.left
+                                                            val badgeTop = (lr.top - bH).coerceAtLeast(drawTop)
+
+                                                            val badgeBg = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                                this.color = android.graphics.Color.WHITE
+                                                                style = android.graphics.Paint.Style.FILL
+                                                            }
+                                                            val rF = android.graphics.RectF(badgeLeft, badgeTop, badgeLeft + bW, badgeTop + bH)
+                                                            drawRoundRect(rF, 2f, 2f, badgeBg)
+                                                            val textY = badgeTop + bH / 2f - (tPaint.descent() + tPaint.ascent()) / 2f
+                                                            drawText(badgeText, badgeLeft + 2f, textY, tPaint)
+                                                        }
+                                                    }
 
                                                     // Draw dark pill card with recognized Japanese text 「...」
                                                     if (group.recognizedText.isNotBlank()) {
@@ -2786,7 +4023,138 @@ fun CrunchLabScreen() {
                                             }
                                         }
                                     }
+
+                                    // ══════════════════ MODULE 6 (TYPESETTING & INPAINTING) ══════════════════
+                                    DebugModule.MODULE_6_TYPESET -> {
+                                        val blocks = activePage?.m6TypesetBlocks ?: emptyList()
+                                        val groupColors = listOf(
+                                            Color(0xFF00E5FF),
+                                            Color(0xFFFFD600),
+                                            Color(0xFFFF4081),
+                                            Color(0xFF76FF03),
+                                            Color(0xFFFF9100),
+                                            Color(0xFFE040FB),
+                                            Color(0xFF00E676),
+                                            Color(0xFF40C4FF),
+                                        )
+
+                                        when (m6SubStep) {
+                                            M6SubStep.CLEAN_CANVAS -> {
+                                                // Step 6.1: Show clean canvas with inpaint boundary guides
+                                                blocks.forEachIndexed { _, blk ->
+                                                    val grpColor = groupColors[(blk.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                                    val cBounds = toCanvasRect(blk.bounds)
+
+                                                    if (blk.isBubble) {
+                                                        drawRoundRect(
+                                                            color = Color(0xFF00E5FF),
+                                                            topLeft = Offset(cBounds.left, cBounds.top),
+                                                            size = Size(cBounds.width, cBounds.height),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(10f, 10f),
+                                                            style = Stroke(width = 1.6f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f)))
+                                                        )
+                                                    } else {
+                                                        drawRoundRect(
+                                                            color = Color(0xFFFFD600),
+                                                            topLeft = Offset(cBounds.left, cBounds.top),
+                                                            size = Size(cBounds.width, cBounds.height),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(6f, 6f),
+                                                            style = Stroke(width = 1.6f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f)))
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            M6SubStep.TYPESET_OUTPUT -> {
+                                                // Step 6.2: Final Typeset Image is already drawn as base image
+                                                // Overlay subtle chord guide lines and font badges
+                                                blocks.forEachIndexed { _, blk ->
+                                                    val grpColor = groupColors[(blk.groupId - 1).coerceAtLeast(0) % groupColors.size]
+                                                    val cBounds = toCanvasRect(blk.bounds)
+
+                                                    // Draw thin boundary around typeset block
+                                                    drawRoundRect(
+                                                        color = grpColor.copy(alpha = 0.5f),
+                                                        topLeft = Offset(cBounds.left, cBounds.top),
+                                                        size = Size(cBounds.width, cBounds.height),
+                                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f),
+                                                        style = Stroke(width = 1.2f)
+                                                    )
+
+                                                    // Draw subtle chord lines indicating dynamic line bounds
+                                                    blk.lines.forEach { line ->
+                                                        val chordLeftPx = line.xCenter - line.chordWidth / 2f
+                                                        val lineLeft = drawLeft + chordLeftPx * (drawW / bmpW)
+                                                        val lineRight = lineLeft + line.chordWidth * (drawW / bmpW)
+                                                        val lineY = drawTop + line.y * (drawH / bmpH)
+                                                        drawLine(
+                                                            color = grpColor.copy(alpha = 0.35f),
+                                                            start = Offset(lineLeft, lineY),
+                                                            end = Offset(lineRight, lineY),
+                                                            strokeWidth = 1f
+                                                        )
+                                                    }
+
+                                                    // Draw Typeset Badge (#T[ID] [font]sp)
+                                                    drawContext.canvas.nativeCanvas.apply {
+                                                        val badgeText = "#T${blk.groupId} ${blk.fontSize.toInt()}sp"
+                                                        val tPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                            this.color = android.graphics.Color.BLACK
+                                                            textSize = 10f
+                                                            typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                                        }
+                                                        val tW = tPaint.measureText(badgeText)
+                                                        val bH = 14f
+                                                        val bW = tW + 6f
+                                                        val badgeLeft = cBounds.left
+                                                        val badgeTop = (cBounds.top - bH).coerceAtLeast(drawTop)
+
+                                                        val badgeBg = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                            this.color = grpColor.toArgb()
+                                                            style = android.graphics.Paint.Style.FILL
+                                                        }
+                                                        val rF = android.graphics.RectF(badgeLeft, badgeTop, badgeLeft + bW, badgeTop + bH)
+                                                        drawRoundRect(rF, 3f, 3f, badgeBg)
+                                                        val textY = badgeTop + bH / 2f - (tPaint.descent() + tPaint.ascent()) / 2f
+                                                        drawText(badgeText, badgeLeft + 3f, textY, tPaint)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ══════════════════ FINAL OUTPUT (PRISTINE TRANSLATED PAGE) ══════════════════
+                                    DebugModule.FINAL_OUTPUT -> {
+                                        // Draw pristine translated page inside clipRect over the original scan
+                                        if (activePage?.m6FinalBitmap != null && !activePage.m6FinalBitmap!!.isRecycled) {
+                                            drawImage(
+                                                image = activePage.m6FinalBitmap!!.asImageBitmap(),
+                                                dstOffset = IntOffset(drawLeft.toInt(), drawTop.toInt()),
+                                                dstSize = IntSize(drawW.toInt(), drawH.toInt())
+                                            )
+                                        }
+                                    }
                                 }
+                            }
+
+                            // Draw Wipe Curtain vertical splitter line and handle for Final screen
+                            if (activeModule == DebugModule.FINAL_OUTPUT && wipeCurtainFraction in 0.01f..0.99f) {
+                                val curtainX = canvasW * wipeCurtainFraction
+                                drawLine(
+                                    color = Color(0xFF00E5FF),
+                                    start = Offset(curtainX, 0f),
+                                    end = Offset(curtainX, canvasH),
+                                    strokeWidth = 2.5f
+                                )
+                                drawCircle(
+                                    color = Color(0xFF00E5FF),
+                                    radius = 14f,
+                                    center = Offset(curtainX, canvasH / 2f)
+                                )
+                                drawCircle(
+                                    color = Color.Black,
+                                    radius = 10f,
+                                    center = Offset(curtainX, canvasH / 2f)
+                                )
                             }
                         }
                     }
@@ -2959,7 +4327,31 @@ fun CrunchLabScreen() {
             onLoadPages = { pageItems ->
                 showCbzBrowserSheet = false
                 loadPagesFromBitmaps(pageItems)
+            },
+            onTranslateCbz = { pages, sourceFile, metadata, pageIndices ->
+                showCbzBrowserSheet = false
+                startCbzBatchTranslation(pages, sourceFile, metadata, pageIndices)
             }
+        )
+    }
+
+    // ══════════════════ MODALS: RESOURCE & PERFORMANCE SETTINGS ══════════════════
+    if (showSettingsSheet) {
+        CrunchSettingsSheet(
+            activeProfile = activeProfile,
+            onProfileChange = { newProfile ->
+                activeProfile = newProfile
+                applyResourceConfig(newProfile, activeDelegate)
+            },
+            activeDelegate = activeDelegate,
+            onDelegateChange = { newDelegate ->
+                activeDelegate = newDelegate
+                applyResourceConfig(activeProfile, newDelegate)
+            },
+            onReleaseResources = {
+                releaseAllResources()
+            },
+            onDismiss = { showSettingsSheet = false }
         )
     }
 
@@ -3181,3 +4573,31 @@ private fun findHeatmapCellAt(
         Pair(Rect(rLeft, rTop, rRight, rBottom), maxP)
     } else null
 }
+
+@Composable
+private fun TimingModuleChip(tag: String, timeText: String, accentColor: Color) {
+    Surface(
+        color = Color(0xFF222222),
+        shape = RoundedCornerShape(5.dp),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.5f))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "$tag: ",
+                color = accentColor,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                timeText,
+                color = Color.White,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+

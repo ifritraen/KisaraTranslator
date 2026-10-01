@@ -1,6 +1,6 @@
 import numpy as np
-from typing import List, Dict, Any, Tuple
-from .types import Rect, TextLineItem, CrunchPartitionItem
+from typing import List, Dict, Any, Tuple, Optional
+from .types import Rect, TextLineItem, CrunchPartitionItem, BubbleMask
 
 class DefectAuditor:
     """
@@ -18,7 +18,8 @@ class DefectAuditor:
         m1_5_items: List[TextLineItem],
         m2_lines: List[TextLineItem],
         m3_partitions: List[CrunchPartitionItem],
-        image_bgr: Optional[np.ndarray] = None
+        image_bgr: Optional[np.ndarray] = None,
+        bubble_masks: Optional[List[BubbleMask]] = None
     ) -> Dict[str, Any]:
         h_img, w_img = image_shape
 
@@ -42,11 +43,11 @@ class DefectAuditor:
         gutter_crossover_count = 0
         furigana_leaks = 0
 
-        # Map each bubbled line to its primary speech bubble (maximum intersection area)
+        # Map each bubbled line to its primary speech bubble (maximum intersection area + mask ratio tie breaker)
         bubble_to_lines = {id(b): [] for b in distinct_bubbles}
         for l in bubbled_lines:
             best_bubble = None
-            max_inter = 0
+            max_score = (-1, -1.0)
             for b in distinct_bubbles:
                 il = max(b.left, l.rect.left)
                 it = max(b.top, l.rect.top)
@@ -54,10 +55,22 @@ class DefectAuditor:
                 ib = min(b.bottom, l.rect.bottom)
                 if ir > il and ib > it:
                     inter_a = (ir - il) * (ib - it)
-                    if inter_a > max_inter:
-                        max_inter = inter_a
+                    m = next((bm for bm in bubble_masks if bm.rect == b), None)
+                    m_ratio = 0.0
+                    if m is not None:
+                        mil = max(m.rect.left, l.rect.left)
+                        mit = max(m.rect.top, l.rect.top)
+                        mir = min(m.rect.right, l.rect.right)
+                        mib = min(m.rect.bottom, l.rect.bottom)
+                        if mir > mil and mib > mit:
+                            sub_m = m.mask[mit - m.rect.top : mib - m.rect.top, mil - m.rect.left : mir - m.rect.left]
+                            la = l.rect.width() * l.rect.height()
+                            m_ratio = float(np.sum(sub_m)) / float(la) if la > 0 else 0.0
+                    score = (inter_a, m_ratio)
+                    if score > max_score:
+                        max_score = score
                         best_bubble = b
-            if best_bubble is not None and max_inter > 0:
+            if best_bubble is not None and max_score[0] > 0:
                 bubble_to_lines[id(best_bubble)].append(l)
 
         # 1. In-bubble audits per speech bubble
@@ -118,13 +131,10 @@ class DefectAuditor:
             if l.rect.width() < 0.50 * global_char_w and l.rect.height() > 16:
                 furigana_leaks += 1
 
-        # 3. Dropped Box Count: genuine non-blank character boxes not covered by M2 lines
-        from .vertical_line_stitcher import VerticalLineStitcher
+        # 3. Dropped Box Count: genuine CTD character boxes not covered by M2 lines (Zero-Drop Engine)
         dropped_box_count = 0
-        for item in m1_5_items:
-            b = item.rect
-            if image_bgr is not None and VerticalLineStitcher.is_box_blank(image_bgr, b):
-                continue
+        boxes_to_audit = m1_boxes if m1_boxes else [item.rect for item in m1_5_items]
+        for b in boxes_to_audit:
             bcx = b.centerX()
             bcy = b.centerY()
             covered = any(
@@ -136,6 +146,69 @@ class DefectAuditor:
             )
             if not covered:
                 dropped_box_count += 1
+
+        # 3b. Empty Bubbles with CTD ink (Non-Collapsible Bubble Bound Invariant: N_ctd(B) >= 1 => N_lines(B) >= 1)
+        empty_bubbles_with_ink = 0
+        for bubble in distinct_bubbles:
+            ctd_boxes_in_b = [
+                b for b in m1_boxes if
+                bubble.contains(b.centerX(), b.centerY()) or
+                (max(bubble.left, b.left) < min(bubble.right, b.right) and
+                 max(bubble.top, b.top) < min(bubble.bottom, b.bottom) and
+                 (min(bubble.right, b.right) - max(bubble.left, b.left)) * (min(bubble.bottom, b.bottom) - max(bubble.top, b.top)) >= 0.45 * b.width() * b.height())
+            ]
+            if ctd_boxes_in_b:
+                lines_in_b = bubble_to_lines.get(id(bubble), [])
+                if len(lines_in_b) == 0:
+                    ink_covered = all(
+                        any(
+                            l.rect.contains(b.centerX(), b.centerY()) or
+                            (max(l.rect.left, b.left) < min(l.rect.right, b.right) and
+                             max(l.rect.top, b.top) < min(l.rect.bottom, b.bottom) and
+                             (min(l.rect.right, b.right) - max(l.rect.left, b.left)) * (min(l.rect.bottom, b.bottom) - max(l.rect.top, b.top)) >= 0.35 * b.width() * b.height())
+                            for l in bubbled_lines
+                        )
+                        for b in ctd_boxes_in_b
+                    )
+                    if not ink_covered:
+                        empty_bubbles_with_ink += 1
+
+        # 3c. Exact Mask Boundary Bleed (Line contained in physical bubble mask)
+        mask_boundary_bleed_count = 0
+        if bubble_masks:
+            for bubble in distinct_bubbles:
+                lines_in_b = bubble_to_lines.get(id(bubble), [])
+                if not lines_in_b:
+                    continue
+                matching_mask = next((bm for bm in bubble_masks if bm.rect == bubble), None)
+                if matching_mask is None:
+                    max_inter = 0
+                    for bm in bubble_masks:
+                        il = max(bm.rect.left, bubble.left)
+                        it = max(bm.rect.top, bubble.top)
+                        ir = min(bm.rect.right, bubble.right)
+                        ib = min(bm.rect.bottom, bubble.bottom)
+                        if ir > il and ib > it:
+                            inter = (ir - il) * (ib - it)
+                            if inter > max_inter:
+                                max_inter = inter
+                                matching_mask = bm
+                if matching_mask is not None:
+                    for l in lines_in_b:
+                        il = max(l.rect.left, matching_mask.rect.left)
+                        it = max(l.rect.top, matching_mask.rect.top)
+                        ir = min(l.rect.right, matching_mask.rect.right)
+                        ib = min(l.rect.bottom, matching_mask.rect.bottom)
+                        if ir > il and ib > it:
+                            sub_mask = matching_mask.mask[it - matching_mask.rect.top:ib - matching_mask.rect.top,
+                                                          il - matching_mask.rect.left:ir - matching_mask.rect.left]
+                            in_pixels = np.sum(sub_mask)
+                            total_pixels = l.rect.width() * l.rect.height()
+                            ratio = (in_pixels / float(total_pixels)) if total_pixels > 0 else 0.0
+                            if ratio < 0.55:
+                                mask_boundary_bleed_count += 1
+                        else:
+                            mask_boundary_bleed_count += 1
 
         # 4. Method 3 Waist Snapping
         conjoined_count = 0
@@ -160,9 +233,11 @@ class DefectAuditor:
             column_pitch_violations +
             width_choking_count +
             boundary_bleed_count +
+            mask_boundary_bleed_count +
             gutter_crossover_count +
             waist_snap_failures +
-            dropped_box_count
+            dropped_box_count +
+            empty_bubbles_with_ink
         )
 
         return {
@@ -184,11 +259,13 @@ class DefectAuditor:
             "column_fragmentations": column_fragmentations,
             "column_pitch_violations": column_pitch_violations,
             "width_choking_count": width_choking_count,
-            "boundary_bleed_count": boundary_bleed_count,
+            "boundary_bleed_count": boundary_bleed_count + mask_boundary_bleed_count,
+            "mask_boundary_bleed_count": mask_boundary_bleed_count,
             "boundary_bleed_area": boundary_bleed_area,
             "gutter_crossover_count": gutter_crossover_count,
             "furigana_leaks": furigana_leaks,
             "dropped_box_count": dropped_box_count,
+            "empty_bubbles_with_ink": empty_bubbles_with_ink,
             "waist_snap_failures": waist_snap_failures,
             "total_violations": total_violations
         }

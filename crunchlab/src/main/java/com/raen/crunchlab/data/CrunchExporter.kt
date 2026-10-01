@@ -6,11 +6,17 @@ import android.util.Log
 import com.raen.crunchlab.engine.PureBorderAngleSplitter
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.os.Build
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -100,20 +106,22 @@ object CrunchExporter {
                 try { File(publicPageDir, "crunch_telemetry.json").writeText(telemetryStr) } catch (_: Exception) {}
             }
 
-            // Helper to save bitmap to all target locations
+            // Helper to save bitmap to all target locations (single-pass PNG compression)
             fun saveStepImage(bmp: Bitmap?, fileName: String) {
                 if (bmp == null || bmp.isRecycled) return
                 try {
-                    // Internal page folder
-                    saveBitmap(bmp, File(internalPageDir, fileName))
-                    // Internal root (mirrors active page)
-                    saveBitmap(bmp, File(internalRoot, fileName))
+                    val bytes = ByteArrayOutputStream().use { bos ->
+                        bmp.compress(Bitmap.CompressFormat.PNG, 90, bos)
+                        bos.toByteArray()
+                    }
+                    // Internal page folder & root
+                    File(internalPageDir, fileName).writeBytes(bytes)
+                    File(internalRoot, fileName).writeBytes(bytes)
 
                     if (publicRoot.exists()) {
-                        // Public page folder
-                        saveBitmap(bmp, File(publicPageDir, fileName))
-                        // Public root
-                        saveBitmap(bmp, File(publicRoot, fileName))
+                        // Public page folder & root
+                        File(publicPageDir, fileName).writeBytes(bytes)
+                        File(publicRoot, fileName).writeBytes(bytes)
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed saving step image $fileName: ${e.message}")
@@ -121,6 +129,7 @@ object CrunchExporter {
             }
 
             val baseBmp = page.sourceBitmap
+            saveStepImage(baseBmp, "page_orig.png")
 
             // 2. Render Module 1 Step Images
             if (page.m1TextProb != null) {
@@ -203,6 +212,19 @@ object CrunchExporter {
                 saveStepImage(m5Bmp, "m5_translation.png")
             }
 
+            // 8. Render Module 6 Step Images (Inpainting & Typesetting)
+            if (page.m6CleanBitmap != null && !page.m6CleanBitmap!!.isRecycled) {
+                saveStepImage(page.m6CleanBitmap, "m6_1_clean_canvas.png")
+            }
+
+            if (page.m6FinalBitmap != null && !page.m6FinalBitmap!!.isRecycled) {
+                val m6TypesetDebugBmp = renderM6TypesetDebug(page.m6FinalBitmap!!, page.m6TypesetBlocks)
+                saveStepImage(m6TypesetDebugBmp, "m6_2_typeset_output.png")
+
+                // Final Clean Translated Page (for user reading)
+                saveStepImage(page.m6FinalBitmap, "final_translated_page.png")
+            }
+
             Log.i(TAG, "CrunchExporter: Full page debug export complete for ${page.label} (Page ${page.index})")
             return rootJsonFile
         } catch (e: Exception) {
@@ -229,6 +251,7 @@ object CrunchExporter {
         // Module 1: CTD Text
         val m1Obj = JSONObject().apply {
             put("status", if (page.m1Lines.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("duration_ms", page.m1DurationMs)
             put("lines_count", page.m1Lines.size)
             put("bubbles_count", page.m1Bubbles.size)
 
@@ -285,6 +308,7 @@ object CrunchExporter {
         // Module 1.5: Categorization
         val m1_5Obj = JSONObject().apply {
             put("status", if (page.m1_5CategorizedBoxes.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("duration_ms", page.m1_5DurationMs)
             put("total_boxes", page.m1_5CategorizedBoxes.size)
             put("bubbled_count", page.m1_5BubbledCount)
             put("orphan_count", page.m1_5OrphanCount)
@@ -307,6 +331,7 @@ object CrunchExporter {
         // Module 2: Single Vertical Lines
         val m2Obj = JSONObject().apply {
             put("status", if (page.m2VerticalLines.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("duration_ms", page.m2DurationMs)
             put("total_lines", page.m2VerticalLines.size)
             put("bubbled_lines_count", page.m2VerticalLines.count { it.category == TextCategory.BUBBLED })
             put("orphan_lines_count", page.m2VerticalLines.count { it.category == TextCategory.ORPHAN })
@@ -332,6 +357,7 @@ object CrunchExporter {
         // Module 3: Waist Crunch
         val m3Obj = JSONObject().apply {
             put("status", if (page.m3Partitions.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("duration_ms", page.m3DurationMs)
             put("total_partitions", page.m3Partitions.size)
             put("conjoined_count", page.m3Partitions.count { it.isConjoined })
             put("cut_rejected_count", page.m3Partitions.count { it.isCutRejected })
@@ -377,6 +403,7 @@ object CrunchExporter {
             put("bubbled_groups_count", groups.count { it.isBubble })
             put("orphan_groups_count", groups.count { !it.isBubble })
             put("total_lines_fed", groups.sumOf { it.lines.size })
+            put("prep_duration_ms", page.m4PrepDurationMs)
             put("ocr_duration_ms", page.m4OcrDurationMs)
 
             val groupsArr = JSONArray()
@@ -400,6 +427,7 @@ object CrunchExporter {
                             put("reading_order", l.readingOrder)
                             put("left", l.rect.left); put("top", l.rect.top); put("right", l.rect.right); put("bottom", l.rect.bottom)
                             put("width", l.rect.width()); put("height", l.rect.height())
+                            if (l.recognizedText.isNotBlank()) put("recognized_text", l.recognizedText)
                         })
                     }
                     put("reading_order_lines", linesArr)
@@ -432,6 +460,39 @@ object CrunchExporter {
             put("groups", groupsArr)
         }
         root.put("module_5_translate", m5Obj)
+
+        // Module 6: Inpainting & Dynamic Shape Typesetting
+        val m6Obj = JSONObject().apply {
+            put("status", if (page.m6TypesetBlocks.isNotEmpty()) "COMPLETED" else "PENDING")
+            put("inpaint_duration_ms", page.m6InpaintDurationMs)
+            put("typeset_duration_ms", page.m6TypesetDurationMs)
+            put("total_blocks_typeset", page.m6TypesetBlocks.size)
+            val blocksArr = JSONArray()
+            page.m6TypesetBlocks.forEach { b ->
+                blocksArr.put(JSONObject().apply {
+                    put("group_id", b.groupId)
+                    put("is_bubble", b.isBubble)
+                    put("font_size", b.fontSize)
+                    put("lines_count", b.lines.size)
+                    put("ja", b.originalJapanese)
+                    put("en", b.translatedEnglish)
+                    val lArr = JSONArray()
+                    b.lines.forEach { l ->
+                        lArr.put(JSONObject().apply {
+                            put("text", l.text)
+                            put("y", l.y)
+                            put("xc", l.xCenter)
+                            put("cw", l.chordWidth)
+                            put("sx", l.scaleX)
+                        })
+                    }
+                    put("lines", lArr)
+                })
+            }
+            put("blocks", blocksArr)
+        }
+        root.put("module_6_typeset", m6Obj)
+        root.put("total_pipeline_duration_ms", page.totalDurationMs)
 
         return root
     }
@@ -930,7 +991,26 @@ object CrunchExporter {
             val rF = RectF(group.bounds)
             canvas.drawRoundRect(rF, 6f, 6f, strokeP)
 
-            // Draw recognized text pill
+            // Draw individual vertical lines inside group with RTL line badges
+            val lineStrokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = color
+                style = Paint.Style.STROKE
+                strokeWidth = 1.4f
+            }
+            val lineFillP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = (color and 0x00FFFFFF) or 0x18000000
+                style = Paint.Style.FILL
+            }
+
+            group.lines.forEach { line ->
+                canvas.drawRect(line.rect, lineStrokeP)
+                canvas.drawRect(line.rect, lineFillP)
+                val lineBadge = "#G${group.groupId}.${line.readingOrder}"
+                val bY = if (line.rect.top > 16) line.rect.top.toFloat() else (line.rect.bottom + 14).toFloat()
+                drawBadgePill(canvas, lineBadge, line.rect.left.toFloat(), bY, 0xFF141418.toInt(), color, 10f)
+            }
+
+            // Draw recognized joined text pill
             val text = group.recognizedText
             if (text.isNotBlank()) {
                 val label = "「$text」"
@@ -1063,6 +1143,35 @@ object CrunchExporter {
         }
 
         drawBannerHeader(canvas, "Module 5: Translation [$engineName] (${groups.size} groups)", base.width)
+        return out
+    }
+
+    private fun renderM6TypesetDebug(base: Bitmap, blocks: List<TypesetBlockItem>): Bitmap {
+        val out = base.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(out)
+
+        val chordPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xAA00E5FF.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1.2f
+        }
+        val boundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xAA00E676.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 1.8f
+        }
+
+        blocks.forEach { block ->
+            canvas.drawRect(block.bounds, boundPaint)
+            block.lines.forEach { line ->
+                val halfW = (line.chordWidth * line.scaleX) / 2f
+                canvas.drawLine(line.xCenter - halfW, line.y, line.xCenter + halfW, line.y, chordPaint)
+            }
+            val badge = "#G${block.groupId} [${"%.1f".format(block.fontSize)}sp × ${block.lines.size}L]"
+            drawBadgePill(canvas, badge, block.bounds.left.toFloat(), block.bounds.top.toFloat().coerceAtLeast(36f), 0xFF141418.toInt(), Color.CYAN, 11f)
+        }
+
+        drawBannerHeader(canvas, "Module 6: Dynamic Chord Typesetting (${blocks.size} blocks)", base.width)
         return out
     }
 
@@ -1267,5 +1376,369 @@ object CrunchExporter {
         bubbleNotes: Map<String, String> = emptyMap()
     ) {
         // Preserved for backward compatibility
+    }
+
+    data class CbzArchiveMetadata(
+        val sourceFile: File,
+        val mangaTitle: String,
+        val nonImageEntries: Map<String, ByteArray> = emptyMap(),
+        val imageEntryNames: List<String> = emptyList(),
+        val localRoot: File
+    )
+
+    data class LocalExportResult(
+        val success: Boolean,
+        val mangaDir: File,
+        val cbzFile: File,
+        val coverFile: File,
+        val totalPages: Int,
+        val errorMessage: String? = null
+    )
+
+    fun naturalCompare(s1: String, s2: String): Int {
+        val regex = Regex("(?<=\\D)(?=\\d)|(?<=\\d)(?=\\D)")
+        val p1 = s1.split(regex)
+        val p2 = s2.split(regex)
+        for (i in 0 until min(p1.size, p2.size)) {
+            val n1 = p1[i].toLongOrNull()
+            val n2 = p2[i].toLongOrNull()
+            if (n1 != null && n2 != null) {
+                val cmp = n1.compareTo(n2)
+                if (cmp != 0) return cmp
+            } else {
+                val cmp = p1[i].compareTo(p2[i], ignoreCase = true)
+                if (cmp != 0) return cmp
+            }
+        }
+        return p1.size.compareTo(p2.size)
+    }
+
+    fun sanitizeFolderName(name: String): String {
+        var sanitized = name
+            .replace('"', '\'')
+            .replace(Regex("[/\\\\:*?<>|]"), "-")
+            .replace(Regex("\\s+"), " ")
+            .trim(' ', '.', '-')
+        if (sanitized.length > 180) {
+            sanitized = sanitized.take(180).trim(' ', '.', '-')
+        }
+        if (sanitized.isBlank()) {
+            sanitized = "Translated Manga"
+        }
+        return sanitized
+    }
+
+    fun findLocalRoot(sourceFile: File? = null): File {
+        var curr = sourceFile?.parentFile
+        while (curr != null && curr.absolutePath != "/" && curr.absolutePath != "/sdcard" && curr.absolutePath != "/storage/emulated/0") {
+            val siblingLocal = File(curr, "local")
+            if (siblingLocal.exists() && siblingLocal.isDirectory) {
+                return siblingLocal
+            }
+            val parentSiblingLocal = File(curr.parentFile ?: curr, "local")
+            if (parentSiblingLocal.exists() && parentSiblingLocal.isDirectory) {
+                return parentSiblingLocal
+            }
+            curr = curr.parentFile
+        }
+
+        val candidates = listOf(
+            "/sdcard/Aaaaa/Otaku/Komikku/local",
+            "/storage/emulated/0/Aaaaa/Otaku/Komikku/local",
+            "/sdcard/Komikku/local",
+            "/sdcard/Mihon/local",
+            "/sdcard/Tachiyomi/local"
+        )
+        for (p in candidates) {
+            val f = File(p)
+            if (f.exists() && f.isDirectory) return f
+        }
+
+        val primary = File("/sdcard/Aaaaa/Otaku/Komikku/local")
+        if (primary.parentFile?.exists() == true || primary.mkdirs()) {
+            return primary
+        }
+
+        val fallback = File("/sdcard/Download/CrunchLab/local").apply { mkdirs() }
+        return fallback
+    }
+
+    fun extractCbzMetadata(sourceFile: File): CbzArchiveMetadata {
+        val nonImages = mutableMapOf<String, ByteArray>()
+        val imageNames = mutableListOf<String>()
+        var seriesTitle: String? = null
+
+        try {
+            ZipFile(sourceFile).use { zip ->
+                val entries = zip.entries().asSequence().toList()
+                for (entry in entries) {
+                    if (entry.isDirectory) continue
+                    val name = entry.name
+                    val lowerName = name.lowercase()
+                    if (lowerName.contains("__macosx") || lowerName.startsWith(".")) continue
+
+                    if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") ||
+                        lowerName.endsWith(".png") || lowerName.endsWith(".webp") ||
+                        lowerName.endsWith(".gif") || lowerName.endsWith(".avif")) {
+                        imageNames.add(name)
+                    } else {
+                        val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                        nonImages[name] = bytes
+                        if (lowerName.endsWith("comicinfo.xml")) {
+                            try {
+                                val xmlStr = String(bytes, Charsets.UTF_8)
+                                val seriesMatch = Regex("<Series>(.*?)</Series>", RegexOption.DOT_MATCHES_ALL).find(xmlStr)
+                                if (seriesMatch != null && seriesMatch.groupValues[1].isNotBlank()) {
+                                    seriesTitle = seriesMatch.groupValues[1].trim()
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Failed parsing Series from ComicInfo.xml: ${e.message}")
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed reading CBZ entries for ${sourceFile.name}: ${e.message}", e)
+        }
+
+        imageNames.sortWith { a, b -> naturalCompare(a, b) }
+
+        val title = seriesTitle
+            ?: (if (!sourceFile.parentFile?.name.isNullOrBlank() && !sourceFile.parentFile!!.name.equals("downloads", ignoreCase = true)) {
+                sourceFile.parentFile!!.name
+            } else {
+                sourceFile.nameWithoutExtension
+            })
+
+        val localRoot = findLocalRoot(sourceFile)
+
+        return CbzArchiveMetadata(
+            sourceFile = sourceFile,
+            mangaTitle = title,
+            nonImageEntries = nonImages,
+            imageEntryNames = imageNames,
+            localRoot = localRoot
+        )
+    }
+
+    fun exportToLocalSource(
+        metadata: CbzArchiveMetadata,
+        translatedPages: Map<Int, Bitmap>,
+        onProgress: ((Int, Int) -> Unit)? = null
+    ): LocalExportResult {
+        return try {
+            val safeTitle = sanitizeFolderName(metadata.mangaTitle)
+            val mangaDir = File(metadata.localRoot, safeTitle).apply { mkdirs() }
+            val coverFile = File(mangaDir, "cover.jpg")
+            val cbzFile = File(mangaDir, metadata.sourceFile.name)
+            val tempCbz = File(mangaDir, "${metadata.sourceFile.name}.tmp")
+
+            try {
+                val nomedia = File(mangaDir, ".nomedia")
+                if (!nomedia.exists()) nomedia.createNewFile()
+            } catch (_: Exception) {}
+
+            // 1. Generate cover.jpg from page 0
+            val page0Bmp = translatedPages[0]
+            if (page0Bmp != null && !page0Bmp.isRecycled) {
+                FileOutputStream(coverFile).use { out ->
+                    page0Bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                }
+            } else if (!coverFile.exists() && metadata.imageEntryNames.isNotEmpty()) {
+                try {
+                    ZipFile(metadata.sourceFile).use { zip ->
+                        val entry = zip.getEntry(metadata.imageEntryNames[0])
+                        if (entry != null) {
+                            val origBmp = zip.getInputStream(entry).use { BitmapFactory.decodeStream(it) }
+                            if (origBmp != null) {
+                                FileOutputStream(coverFile).use { out ->
+                                    origBmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                                }
+                                origBmp.recycle()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed creating cover.jpg from original page 0: ${e.message}")
+                }
+            }
+
+            // 2. Repack CBZ with ComicInfo.xml and translated pages
+            val total = metadata.imageEntryNames.size
+            ZipFile(metadata.sourceFile).use { sourceZip ->
+                ZipOutputStream(FileOutputStream(tempCbz).buffered(64 * 1024)).use { zos ->
+                    zos.setLevel(Deflater.BEST_SPEED)
+
+                    // Write ComicInfo.xml and other non-image entries
+                    if (metadata.nonImageEntries.isNotEmpty()) {
+                        for ((entryName, bytes) in metadata.nonImageEntries) {
+                            val entry = ZipEntry(entryName)
+                            zos.putNextEntry(entry)
+                            zos.write(bytes)
+                            zos.closeEntry()
+                        }
+                    } else {
+                        val defaultXml = """<?xml version='1.0' encoding='UTF-8' ?>
+<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Title>${metadata.sourceFile.nameWithoutExtension}</Title>
+  <Series>$safeTitle</Series>
+</ComicInfo>""".trimIndent().toByteArray(Charsets.UTF_8)
+                        val entry = ZipEntry("ComicInfo.xml")
+                        zos.putNextEntry(entry)
+                        zos.write(defaultXml)
+                        zos.closeEntry()
+                    }
+
+                    // Write all pages matching original entry name and extension
+                    for ((idx, entryName) in metadata.imageEntryNames.withIndex()) {
+                        val translatedBmp = translatedPages[idx]
+                        val entry = ZipEntry(entryName)
+                        zos.putNextEntry(entry)
+
+                        if (translatedBmp != null && !translatedBmp.isRecycled) {
+                            val ext = entryName.substringAfterLast('.', "").lowercase()
+                            when (ext) {
+                                "webp" -> {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        translatedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 90, zos)
+                                    } else {
+                                        @Suppress("DEPRECATION")
+                                        translatedBmp.compress(Bitmap.CompressFormat.WEBP, 90, zos)
+                                    }
+                                }
+                                "jpg", "jpeg" -> {
+                                    translatedBmp.compress(Bitmap.CompressFormat.JPEG, 90, zos)
+                                }
+                                else -> {
+                                    translatedBmp.compress(Bitmap.CompressFormat.PNG, 90, zos)
+                                }
+                            }
+                        } else {
+                            val srcEntry = sourceZip.getEntry(entryName)
+                            if (srcEntry != null) {
+                                sourceZip.getInputStream(srcEntry).use { input ->
+                                    input.copyTo(zos)
+                                }
+                            }
+                        }
+
+                        zos.closeEntry()
+                        onProgress?.invoke(idx + 1, total)
+                    }
+                }
+            }
+
+            if (cbzFile.exists()) {
+                cbzFile.delete()
+            }
+            val renamed = tempCbz.renameTo(cbzFile)
+            if (!renamed) {
+                tempCbz.copyTo(cbzFile, overwrite = true)
+                tempCbz.delete()
+            }
+
+            // Also place inspection copy in /sdcard/Download/CrunchLab
+            try {
+                val publicDir = File("/sdcard/Download/CrunchLab")
+                if (publicDir.exists()) {
+                    val publicCopy = File(publicDir, cbzFile.name)
+                    cbzFile.copyTo(publicCopy, overwrite = true)
+                }
+            } catch (_: Exception) {}
+
+            LocalExportResult(
+                success = true,
+                mangaDir = mangaDir,
+                cbzFile = cbzFile,
+                coverFile = coverFile,
+                totalPages = total
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "exportToLocalSource failed: ${e.message}", e)
+            LocalExportResult(
+                success = false,
+                mangaDir = File(metadata.localRoot, sanitizeFolderName(metadata.mangaTitle)),
+                cbzFile = File(File(metadata.localRoot, sanitizeFolderName(metadata.mangaTitle)), metadata.sourceFile.name),
+                coverFile = File(File(metadata.localRoot, sanitizeFolderName(metadata.mangaTitle)), "cover.jpg"),
+                totalPages = metadata.imageEntryNames.size,
+                errorMessage = e.message
+            )
+        }
+    }
+
+    /**
+     * Determines the output file name for translated CBZ archive.
+     * Matches standard "Chapter {X} Translated.cbz" or "${originalTitle} Translated.cbz".
+     */
+    fun getTranslatedCbzName(sourceFile: File): String {
+        val nameWithoutExt = sourceFile.nameWithoutExtension
+        val parentName = sourceFile.parentFile?.name ?: ""
+
+        val chapterRegex = Regex("(?:Chapter|Ch\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE)
+
+        val matchInFile = chapterRegex.find(nameWithoutExt)
+        if (matchInFile != null) {
+            return "$nameWithoutExt Translated.cbz"
+        }
+
+        if (nameWithoutExt.equals("Chapter", ignoreCase = true) || nameWithoutExt.equals("Chapter.cbz", ignoreCase = true)) {
+            val matchInParent = chapterRegex.find(parentName)
+            if (matchInParent != null) {
+                val chNum = matchInParent.groupValues[1]
+                return "Chapter $chNum Translated.cbz"
+            }
+            if (parentName.isNotBlank() && !parentName.equals("downloads", ignoreCase = true)) {
+                return "$parentName Translated.cbz"
+            }
+            return "Chapter Translated.cbz"
+        }
+
+        return "$nameWithoutExt Translated.cbz"
+    }
+
+    /**
+     * Packages a list of translated page bitmaps into a CBZ archive.
+     */
+    fun createTranslatedCbz(
+        outputFile: File,
+        pages: List<Pair<String, Bitmap>>,
+        onProgress: ((Int, Int) -> Unit)? = null
+    ): Boolean {
+        return try {
+            val parentDir = outputFile.parentFile
+            if (parentDir != null && !parentDir.exists()) {
+                parentDir.mkdirs()
+            }
+            val tempFile = File(parentDir ?: File("/sdcard/Download/CrunchLab"), "${outputFile.name}.tmp")
+            val total = pages.size
+
+            ZipOutputStream(FileOutputStream(tempFile).buffered(64 * 1024)).use { zos ->
+                zos.setLevel(Deflater.BEST_SPEED)
+                for ((index, item) in pages.withIndex()) {
+                    val (_, bmp) = item
+                    if (bmp.isRecycled) continue
+                    val entryName = String.format(Locale.US, "page_%03d.png", index + 1)
+                    val entry = ZipEntry(entryName)
+                    zos.putNextEntry(entry)
+                    bmp.compress(Bitmap.CompressFormat.PNG, 90, zos)
+                    zos.closeEntry()
+                    onProgress?.invoke(index + 1, total)
+                }
+            }
+
+            if (outputFile.exists()) {
+                outputFile.delete()
+            }
+            val renamed = tempFile.renameTo(outputFile)
+            if (!renamed) {
+                tempFile.copyTo(outputFile, overwrite = true)
+                tempFile.delete()
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create CBZ ${outputFile.absolutePath}: ${e.message}", e)
+            false
+        }
     }
 }

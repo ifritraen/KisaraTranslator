@@ -117,15 +117,18 @@ object DialogueGroupPreparer {
         // Step 3: Handle Regular Speech Bubbles
         // Consolidate bubbles from bubbleRegions and un-partitioned bubbleMasks
         val processedBubbleRects = conjoinedParts.map { it.bubbleRect }
-        val regularBubbles = (bubbleRegions + bubbleMasks.filter { !it.isLobe }.map { it.rect })
-            .distinct()
-            .filter { b -> processedBubbleRects.none { p -> rectIntersectionRatio(b, p) > 0.70f } }
+        val regularBubbles = (if (bubbleMasks.isNotEmpty()) {
+            bubbleMasks.filter { !it.isLobe }.map { it.rect }
+        } else {
+            bubbleRegions
+        }).distinct()
+          .filter { b -> processedBubbleRects.none { p -> rectIntersectionRatio(b, p) > 0.70f } }
 
         for ((bIdx, bubble) in regularBubbles.withIndex()) {
             // Find unassigned lines belonging to this bubble
             val bubbleLines = candidateLines.filter { line ->
                 line.id !in assignedLineIds &&
-                    (line.category == TextCategory.BUBBLED || bubble.contains(line.rect.centerX(), line.rect.centerY()) ||
+                    (bubble.contains(line.rect.centerX(), line.rect.centerY()) ||
                      rectIntersectionRatio(line.rect, bubble) >= 0.40f) &&
                     isLineBestAssignedToBubble(line.rect, bubble, regularBubbles)
             }

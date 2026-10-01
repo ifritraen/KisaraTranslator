@@ -8,6 +8,7 @@ class Rect:
     top: int
     right: int
     bottom: int
+    id: Optional[int] = None
 
     def __post_init__(self):
         self.left = int(self.left)
@@ -34,8 +35,17 @@ class Rect:
         return (self.left <= other.left and self.top <= other.top and
                 self.right >= other.right and self.bottom >= other.bottom)
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Rect):
+            return False
+        return (self.left == other.left and self.top == other.top and
+                self.right == other.right and self.bottom == other.bottom)
+
+    def __hash__(self) -> int:
+        return hash((self.left, self.top, self.right, self.bottom))
+
     def copy(self) -> 'Rect':
-        return Rect(self.left, self.top, self.right, self.bottom)
+        return Rect(self.left, self.top, self.right, self.bottom, id=self.id)
 
     def set(self, l: int, t: int, r: int, b: int):
         self.left = int(l)
@@ -89,6 +99,9 @@ class BubbleMask:
     width: int
     height: int
     fill_area: int
+    id: Optional[int] = None
+    is_lobe: bool = False
+    parent_bubble_index: Optional[int] = None
 
 @dataclass
 class CrunchPartitionItem:

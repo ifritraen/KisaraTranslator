@@ -67,6 +67,21 @@ class Method3WaistEngine(
         return loadModel(modelFile)
     }
 
+    var configuredThreads: Int = 4
+    var hardwareDelegate: com.raen.crunchlab.engine.profile.HardwareDelegate = com.raen.crunchlab.engine.profile.HardwareDelegate.XNNPACK
+
+    fun setResourceConfig(threads: Int, delegate: com.raen.crunchlab.engine.profile.HardwareDelegate = hardwareDelegate) {
+        val numCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val safeThreads = threads.coerceIn(1, numCores)
+        if (safeThreads != configuredThreads || delegate != hardwareDelegate) {
+            configuredThreads = safeThreads
+            hardwareDelegate = delegate
+            session?.close()
+            session = null
+            loadedPath = null
+        }
+    }
+
     @Synchronized
     fun loadModel(modelFile: File): Boolean {
         if (loadedPath == modelFile.absolutePath && session != null) return true
@@ -75,11 +90,11 @@ class Method3WaistEngine(
         loadedPath = null
         if (!modelFile.exists() || modelFile.length() < ModelDownloader.MIN_SIZE_WAIST) return false
 
-        val opts = AiBufferUtils.createSessionOptions(threads = 2)
+        val opts = AiBufferUtils.createSessionOptions(threads = configuredThreads, delegate = hardwareDelegate)
         return try {
             session = env.createSession(modelFile.absolutePath, opts)
             loadedPath = modelFile.absolutePath
-            Log.i("Method3WaistEngine", "Loaded waist model: ${modelFile.name} (${modelFile.length() / 1024}KB)")
+            Log.i("Method3WaistEngine", "Loaded waist model ($configuredThreads-threads, ${hardwareDelegate.shortLabel}): ${modelFile.name} (${modelFile.length() / 1024}KB)")
             true
         } catch (e: Exception) {
             Log.e("Method3WaistEngine", "Waist model load failed: ${e.message}")
@@ -655,6 +670,238 @@ class Method3WaistEngine(
         }
     }
 
+
+    fun partitionConjoinedBubbles(
+        bitmap: Bitmap,
+        bubbleMasks: List<BubbleMask>,
+        ctdBubbles: List<Rect>
+    ): Triple<List<BubbleMask>, List<Rect>, List<CrunchPartitionItem>> {
+        val bmpW = bitmap.width
+        val bmpH = bitmap.height
+
+        val validMasks = bubbleMasks.filter { it.width >= 18 && it.height >= 22 && it.width * it.height >= 400 }
+        val validCtd = ctdBubbles.filter { it.width() >= 18 && it.height() >= 22 && it.width() * it.height() >= 400 }
+        val allRects = if (validMasks.isNotEmpty()) validMasks.map { it.rect } else validCtd
+
+        val initialBubbles = mutableListOf<Rect>()
+        for (b in allRects) {
+            val existing = initialBubbles.firstOrNull { other ->
+                val il = max(other.left, b.left)
+                val it = max(other.top, b.top)
+                val ir = min(other.right, b.right)
+                val ib = min(other.bottom, b.bottom)
+                if (ir > il && ib > it) {
+                    val interA = (ir - il).toLong() * (ib - it).toLong()
+                    val minA = min(other.width().toLong() * other.height().toLong(), b.width().toLong() * b.height().toLong())
+                    minA > 0 && (interA.toFloat() / minA.toFloat()) > 0.45f
+                } else false
+            }
+            if (existing != null) {
+                existing.left = min(existing.left, b.left)
+                existing.top = min(existing.top, b.top)
+                existing.right = max(existing.right, b.right)
+                existing.bottom = max(existing.bottom, b.bottom)
+            } else {
+                initialBubbles.add(Rect(b))
+            }
+        }
+
+        val partitions = mutableListOf<CrunchPartitionItem>()
+        val newBubbleMasks = mutableListOf<BubbleMask>()
+        val newDistinctBubbles = mutableListOf<Rect>()
+
+        for ((bIdx, bRect) in initialBubbles.withIndex()) {
+            val pad = 4
+            val left = (bRect.left - pad).coerceIn(0, bmpW - 1)
+            val top = (bRect.top - pad).coerceIn(0, bmpH - 1)
+            val right = (bRect.right + pad).coerceIn(left + 1, bmpW)
+            val bottom = (bRect.bottom + pad).coerceIn(top + 1, bmpH)
+            val cropW = right - left
+            val cropH = bottom - top
+
+            if (cropW < 12 || cropH < 12) {
+                newDistinctBubbles.add(bRect)
+                continue
+            }
+
+            val cropBmp = try {
+                Bitmap.createBitmap(bitmap, left, top, cropW, cropH)
+            } catch (e: Exception) {
+                null
+            }
+            if (cropBmp == null) {
+                newDistinctBubbles.add(bRect)
+                continue
+            }
+
+            val pred = predictCrop(cropBmp)
+            cropBmp.recycle()
+
+            val bm = validMasks.firstOrNull { m ->
+                m.rect.contains(bRect.centerX(), bRect.centerY()) ||
+                (max(m.rect.left, bRect.left) < min(m.rect.right, bRect.right) &&
+                 max(m.rect.top, bRect.top) < min(m.rect.bottom, bRect.bottom) &&
+                 (min(m.rect.right, bRect.right) - max(m.rect.left, bRect.left)).toLong() *
+                 (min(m.rect.bottom, bRect.bottom) - max(m.rect.top, bRect.top)).toLong() >= 0.50f * bRect.width().toLong() * bRect.height().toLong())
+            }
+
+            if (pred == null || !pred.isConjoined) {
+                newDistinctBubbles.add(bRect)
+                if (bm != null && bm !in newBubbleMasks) {
+                    newBubbleMasks.add(bm)
+                }
+                partitions.add(
+                    CrunchPartitionItem(
+                        bubbleIndex = bIdx,
+                        bubbleRect = bRect,
+                        isConjoined = false,
+                        confConj = pred?.confConj ?: 0f,
+                        p1Raw = null,
+                        p2Raw = null,
+                        p1Snapped = null,
+                        p2Snapped = null
+                    )
+                )
+                continue
+            }
+
+            val p1RawPage = Point((pred.p1RawCrop.x + left).roundToInt(), (pred.p1RawCrop.y + top).roundToInt())
+            val p2RawPage = Point((pred.p2RawCrop.x + left).roundToInt(), (pred.p2RawCrop.y + top).roundToInt())
+            val p1SnappedPage = Point(pred.p1SnappedCrop.x + left, pred.p1SnappedCrop.y + top)
+            val p2SnappedPage = Point(pred.p2SnappedCrop.x + left, pred.p2SnappedCrop.y + top)
+            val pageCandidates = pred.candidatesCrop.map { Point(it.x + left, it.y + top) }
+
+            var partitionSuccess = false
+            if (bm != null) {
+                val p1mX = p1SnappedPage.x - bm.rect.left
+                val p1mY = p1SnappedPage.y - bm.rect.top
+                val p2mX = p2SnappedPage.x - bm.rect.left
+                val p2mY = p2SnappedPage.y - bm.rect.top
+
+                val maskA = BooleanArray(bm.width * bm.height)
+                val maskB = BooleanArray(bm.width * bm.height)
+                var areaA = 0
+                var areaB = 0
+
+                var minAx = bm.width; var maxAx = -1; var minAy = bm.height; var maxAy = -1
+                var minBx = bm.width; var maxBx = -1; var minBy = bm.height; var maxBy = -1
+
+                for (y in 0 until bm.height) {
+                    val rowOff = y * bm.width
+                    for (x in 0 until bm.width) {
+                        if (bm.mask[rowOff + x]) {
+                            val dMap = (x - p1mX).toLong() * (p2mY - p1mY).toLong() - (y - p1mY).toLong() * (p2mX - p1mX).toLong()
+                            if (dMap >= 0) {
+                                maskA[rowOff + x] = true
+                                areaA++
+                                if (x < minAx) minAx = x
+                                if (x > maxAx) maxAx = x
+                                if (y < minAy) minAy = y
+                                if (y > maxAy) maxAy = y
+                            } else {
+                                maskB[rowOff + x] = true
+                                areaB++
+                                if (x < minBx) minBx = x
+                                if (x > maxBx) maxBx = x
+                                if (y < minBy) minBy = y
+                                if (y > maxBy) maxBy = y
+                            }
+                        }
+                    }
+                }
+
+                if (areaA >= 40 && areaB >= 40 && maxAx >= minAx && maxBx >= minBx) {
+                    val rectA = Rect(bm.rect.left + minAx, bm.rect.top + minAy, bm.rect.left + maxAx + 1, bm.rect.top + maxAy + 1)
+                    val subW_A = rectA.width()
+                    val subH_A = rectA.height()
+                    val subMaskA = BooleanArray(subW_A * subH_A)
+                    for (sy in 0 until subH_A) {
+                        val srcY = minAy + sy
+                        for (sx in 0 until subW_A) {
+                            val srcX = minAx + sx
+                            subMaskA[sy * subW_A + sx] = maskA[srcY * bm.width + srcX]
+                        }
+                    }
+                    val bmA = BubbleMask(
+                        rect = rectA, mask = subMaskA, width = subW_A, height = subH_A,
+                        fillArea = areaA, isLobe = true, parentBubbleIndex = bIdx
+                    )
+
+                    val rectB = Rect(bm.rect.left + minBx, bm.rect.top + minBy, bm.rect.left + maxBx + 1, bm.rect.top + maxBy + 1)
+                    val subW_B = rectB.width()
+                    val subH_B = rectB.height()
+                    val subMaskB = BooleanArray(subW_B * subH_B)
+                    for (sy in 0 until subH_B) {
+                        val srcY = minBy + sy
+                        for (sx in 0 until subW_B) {
+                            val srcX = minBx + sx
+                            subMaskB[sy * subW_B + sx] = maskB[srcY * bm.width + srcX]
+                        }
+                    }
+                    val bmB = BubbleMask(
+                        rect = rectB, mask = subMaskB, width = subW_B, height = subH_B,
+                        fillArea = areaB, isLobe = true, parentBubbleIndex = bIdx
+                    )
+
+                    newDistinctBubbles.add(rectA)
+                    newDistinctBubbles.add(rectB)
+                    newBubbleMasks.add(bmA)
+                    newBubbleMasks.add(bmB)
+                    partitionSuccess = true
+                }
+            }
+
+            if (!partitionSuccess) {
+                newDistinctBubbles.add(bRect)
+                if (bm != null && bm !in newBubbleMasks) {
+                    newBubbleMasks.add(bm)
+                }
+            }
+
+            val partItem = CrunchPartitionItem(
+                bubbleIndex = bIdx,
+                bubbleRect = bRect,
+                isConjoined = true,
+                confConj = pred.confConj,
+                p1Raw = p1RawPage,
+                p2Raw = p2RawPage,
+                p1Snapped = p1SnappedPage,
+                p2Snapped = p2SnappedPage,
+                candidatePoints = pageCandidates,
+                lobeALineIds = mutableListOf(),
+                lobeBLineIds = mutableListOf(),
+                splitLines = emptyList()
+            )
+            partitions.add(partItem)
+        }
+
+        return Triple(newBubbleMasks, newDistinctBubbles, partitions)
+    }
+
+    fun assignPartitionLines(partitions: List<CrunchPartitionItem>, allLines: List<TextLineItem>): List<CrunchPartitionItem> {
+        return partitions.map { part ->
+            if (!part.isConjoined || part.p1Snapped == null || part.p2Snapped == null) {
+                part
+            } else {
+                val bRect = part.bubbleRect
+                val p1 = part.p1Snapped
+                val p2 = part.p2Snapped
+                val bLines = allLines.filter { bRect.contains(it.rect.centerX(), it.rect.centerY()) }
+                val aIds = mutableListOf<Int>()
+                val bIds = mutableListOf<Int>()
+                for (l in bLines) {
+                    val dVal = (l.rect.centerX() - p1.x).toLong() * (p2.y - p1.y).toLong() -
+                               (l.rect.centerY() - p1.y).toLong() * (p2.x - p1.x).toLong()
+                    if (dVal >= 0) {
+                        aIds.add(l.id)
+                    } else {
+                        bIds.add(l.id)
+                    }
+                }
+                part.copy(lobeALineIds = aIds, lobeBLineIds = bIds)
+            }
+        }
+    }
 
     override fun close() {
         session?.close()

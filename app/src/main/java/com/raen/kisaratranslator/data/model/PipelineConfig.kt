@@ -70,7 +70,7 @@ data class PipelineConfig(
     val geminiModel: String = "gemini-2.5-flash",
     val groqApiKey: String = "",
     val groqModel: String = "qwen/qwen3.6-27b",
-    val sugoiBeamWidth: Int = 1, // 1 = Fast Greedy (default), 3 = Quality Beam Search
+    val sugoiBeamWidth: Int = 1, // 1 = Fast Greedy (default), 2 = Quality Beam Search
     val qwenEndpoint: String = "",
     val qwenApiKey: String = "",
     val enhancedPipeline: Boolean = false, // false = Method 1 (Standard), true = Method 2 (Enhanced)

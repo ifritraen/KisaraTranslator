@@ -145,7 +145,7 @@ class SugoiTranslator(
         val enc = encoderSession ?: return@withContext text
         val dec = decoderSession ?: return@withContext text
 
-        val cleanText = text.replace("\n", " ").trim()
+        val cleanText = preprocessJapanese(text)
         if (cleanText.isBlank()) return@withContext ""
 
         val tokenIds = tok.encode(cleanText)
@@ -167,7 +167,7 @@ class SugoiTranslator(
             encOut = enc.run(mapOf("input_ids" to inputIdsTensor))
             hiddenStates = (encOut["last_hidden_state"]?.get() ?: encOut[0].value) as OnnxTensor
 
-            val maxTokens = min(45, max(12, fullInputIds.size * 3 + 4))
+            val maxTokens = min(50, max(6, fullInputIds.size * 2 + 2))
 
             if (beamWidth <= 1) {
                 // High-Speed Greedy Decoding Path (1 ONNX session run per token step)
@@ -212,6 +212,28 @@ class SugoiTranslator(
 
                         logits.close()
 
+                        // Suppress token if repeating 2+ times consecutively
+                        if (decodedIds.size >= 3 && decodedIds[decodedIds.size - 1] == decodedIds[decodedIds.size - 2]) {
+                            val repeating = decodedIds.last()
+                            if (repeating in 0 until vocabSize) {
+                                lastVocabBuf[repeating] = Float.NEGATIVE_INFINITY
+                            }
+                        }
+
+                        // 3-gram repetition blocking: prevent (tokA, tokB, tokC) from recurring
+                        if (decodedIds.size >= 3) {
+                            val tokA = decodedIds[decodedIds.size - 2]
+                            val tokB = decodedIds[decodedIds.size - 1]
+                            for (i in 1 until decodedIds.size - 2) {
+                                if (decodedIds[i] == tokA && decodedIds[i + 1] == tokB) {
+                                    val banned = decodedIds[i + 2]
+                                    if (banned in 0 until vocabSize) {
+                                        lastVocabBuf[banned] = Float.NEGATIVE_INFINITY
+                                    }
+                                }
+                            }
+                        }
+
                         // Fast argmax on logits (monotonic with softmax, zero exponential math)
                         var maxLogit = Float.NEGATIVE_INFINITY
                         var bestToken = eosId
@@ -225,14 +247,6 @@ class SugoiTranslator(
 
                         if (bestToken == eosId) break
 
-                        // Repetition loop guard: stop early if the same token repeats 3 times
-                        if (decodedIds.size >= 3 &&
-                            decodedIds[decodedIds.size - 1] == bestToken &&
-                            decodedIds[decodedIds.size - 2] == bestToken
-                        ) {
-                            break
-                        }
-
                         decodedIds.add(bestToken)
                     } finally {
                         decInputTensor.close()
@@ -242,9 +256,11 @@ class SugoiTranslator(
 
                 val finalTokens = decodedIds.drop(1).filter { it !in listOf(0, 1, 2) }
                 val decoded = tok.decode(finalTokens)
-                if (decoded.isBlank()) cleanText else decoded
+                val rawResult = if (decoded.isBlank()) cleanText else decoded
+                postProcessEnglish(rawResult)
             } else {
-                // Optimized Beam Search Decoding Path
+                // Quality Beam Search Decoding Path (Width 2)
+                val effectiveBeamWidth = 2
                 data class BeamCandidate(
                     val tokens: MutableList<Int>,
                     var score: Float,
@@ -253,6 +269,8 @@ class SugoiTranslator(
 
                 var beams = mutableListOf(BeamCandidate(mutableListOf(2), 0f))
                 var lastVocabBuf: FloatArray? = null
+                val repPenalty = 1.15f
+                val lenPenaltyExp = 0.6
 
                 for (step in 0 until maxTokens) {
                     val nextCandidates = mutableListOf<BeamCandidate>()
@@ -292,6 +310,41 @@ class SugoiTranslator(
 
                             logits.close()
 
+                            // Repetition penalty on already emitted tokens (Keskar et al. 2019)
+                            if (cand.tokens.size > 1) {
+                                for (t in cand.tokens.drop(1)) {
+                                    if (t in 0 until vocabSize) {
+                                        if (lastVocabBuf[t] > 0) {
+                                            lastVocabBuf[t] /= repPenalty
+                                        } else {
+                                            lastVocabBuf[t] *= repPenalty
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Suppress token if repeating 2+ times consecutively
+                            if (cand.tokens.size >= 3 && cand.tokens[cand.tokens.size - 1] == cand.tokens[cand.tokens.size - 2]) {
+                                val repeating = cand.tokens.last()
+                                if (repeating in 0 until vocabSize) {
+                                    lastVocabBuf[repeating] = Float.NEGATIVE_INFINITY
+                                }
+                            }
+
+                            // 3-gram repetition blocking
+                            if (cand.tokens.size >= 3) {
+                                val tokA = cand.tokens[cand.tokens.size - 2]
+                                val tokB = cand.tokens[cand.tokens.size - 1]
+                                for (i in 1 until cand.tokens.size - 2) {
+                                    if (cand.tokens[i] == tokA && cand.tokens[i + 1] == tokB) {
+                                        val banned = cand.tokens[i + 2]
+                                        if (banned in 0 until vocabSize) {
+                                            lastVocabBuf[banned] = Float.NEGATIVE_INFINITY
+                                        }
+                                    }
+                                }
+                            }
+
                             // Find max for numerical stability in log-softmax
                             var maxLogit = Float.NEGATIVE_INFINITY
                             for (v in 0 until vocabSize) {
@@ -303,12 +356,12 @@ class SugoiTranslator(
                             }
                             val logSumExp = (maxLogit + kotlin.math.ln(sumExp)).toFloat()
 
-                            // Extract top beamWidth tokens for this beam
-                            val indexedLogits = Array(beamWidth) { Pair(0, Float.NEGATIVE_INFINITY) }
+                            // Extract top effectiveBeamWidth tokens for this beam
+                            val indexedLogits = Array(effectiveBeamWidth) { Pair(0, Float.NEGATIVE_INFINITY) }
                             for (v in 0 until vocabSize) {
                                 val logProb = lastVocabBuf[v] - logSumExp
-                                if (logProb > indexedLogits[beamWidth - 1].second) {
-                                    indexedLogits[beamWidth - 1] = Pair(v, logProb)
+                                if (logProb > indexedLogits[effectiveBeamWidth - 1].second) {
+                                    indexedLogits[effectiveBeamWidth - 1] = Pair(v, logProb)
                                     indexedLogits.sortByDescending { it.second }
                                 }
                             }
@@ -326,19 +379,27 @@ class SugoiTranslator(
                         }
                     }
 
-                    // Sort and retain top beamWidth candidates normalized by length
-                    nextCandidates.sortByDescending { it.score / Math.pow(it.tokens.size.toDouble(), 0.6).toFloat() }
-                    beams = nextCandidates.take(beamWidth).toMutableList()
-                    if (beams.all { it.finished }) break
+                    // Sort and retain top effectiveBeamWidth candidates normalized by length
+                    nextCandidates.sortByDescending { it.score / Math.pow(it.tokens.size.toDouble(), lenPenaltyExp).toFloat() }
+                    beams = nextCandidates.take(effectiveBeamWidth).toMutableList()
+
+                    // Early stopping: if candidate 0 finishes and is clearly superior or all finished
+                    if (beams.isNotEmpty() && beams[0].finished) {
+                        if (beams.size < 2 || beams[1].finished) break
+                        val cand0Norm = beams[0].score / Math.pow(beams[0].tokens.size.toDouble(), lenPenaltyExp).toFloat()
+                        val cand1Norm = beams[1].score / Math.pow(beams[1].tokens.size.toDouble(), lenPenaltyExp).toFloat()
+                        if (cand0Norm - cand1Norm > 2.0f) break
+                    }
                 }
 
                 val bestBeam = beams.maxByOrNull {
-                    it.score / Math.pow(max(1, it.tokens.size - 1).toDouble(), 0.6).toFloat()
+                    it.score / Math.pow(max(1, it.tokens.size - 1).toDouble(), lenPenaltyExp).toFloat()
                 } ?: beams.firstOrNull()
 
                 val finalTokens = bestBeam?.tokens?.drop(1)?.filter { it !in listOf(0, 1, 2) } ?: emptyList()
                 val decoded = tok.decode(finalTokens)
-                if (decoded.isBlank()) cleanText else decoded
+                val rawResult = if (decoded.isBlank()) cleanText else decoded
+                postProcessEnglish(rawResult)
             }
         } catch (e: Exception) {
             Log.e("SugoiTranslator", "Sugoi inference error", e)
@@ -365,7 +426,14 @@ class SugoiTranslator(
         private val enVocab: Array<String>,
     ) {
         fun encode(text: String): List<Int> {
-            val spText = "\u2581${text.replace(" ", "\u2581")}"
+            val normalized = text
+                .replace('！', '!')
+                .replace('？', '?')
+                .replace("…", "...")
+                .replace("‥", "..")
+                .replace('～', '〜')
+                .replace('　', ' ')
+            val spText = "\u2581${normalized.replace(" ", "\u2581")}"
             val n = spText.length
             val dp = FloatArray(n + 1) { -1e9f }
             dp[0] = 0f
@@ -374,6 +442,16 @@ class SugoiTranslator(
 
             for (i in 0 until n) {
                 if (dp[i] <= -1e8f) continue
+
+                // Single-character <unk> fallback transition (token ID 3, penalty -15f)
+                // Ensures unknown characters (emojis, unmapped symbols) never sever the Viterbi chain
+                val unkScore = dp[i] - 15f
+                if (unkScore > dp[i + 1]) {
+                    dp[i + 1] = unkScore
+                    prev[i + 1] = i
+                    tokMap[i + 1] = 3
+                }
+
                 val maxLen = min(n + 1, i + 32)
                 for (j in i + 1 until maxLen) {
                     val sub = spText.substring(i, j)
@@ -433,4 +511,37 @@ class SugoiTranslator(
             }
         }
     }
+
+    companion object {
+        fun preprocessJapanese(text: String): String {
+            var s = text.replace("\n", " ").trim()
+            if (s.isEmpty()) return ""
+
+            // 1. Collapse 3+ repeating kana/letters to 2 (e.g. あああああ -> ああ, いぃぃぃ -> いい)
+            s = s.replace(Regex("([\\p{IsHiragana}\\p{IsKatakana}a-zA-Zー])\\1{2,}"), "$1$1")
+
+            // 2. Insert space before attached stylized symbols so the tokenizer separates them cleanly
+            s = s.replace(Regex("([^\\s])([♡♥〜～♪])"), "$1 $2")
+
+            // 3. Fullwidth & Zenkaku punctuation normalization
+            s = s.replace('！', '!')
+                .replace('？', '?')
+                .replace("…", "...")
+                .replace("‥", "..")
+                .replace('～', '〜')
+                .replace('　', ' ')
+
+            return s.trim()
+        }
+
+        fun postProcessEnglish(text: String): String {
+            if (text.isBlank()) return text
+            val capitalized = text.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            return capitalized
+                .replace(Regex("\\s+([!?,.:;])"), "$1")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+        }
+    }
 }
+

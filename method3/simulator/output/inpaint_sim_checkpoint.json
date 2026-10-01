@@ -1,0 +1,27 @@
+{
+  "completed": 400,
+  "total": 400,
+  "latest": {
+    "page_id": "batch4_c07_p019.webp",
+    "batch": "batch4",
+    "filename": "c07_p019.webp",
+    "width": 1080,
+    "height": 1530,
+    "ctd_boxes": 128,
+    "bubbles": 8,
+    "bubbled_lines": 25,
+    "orphan_lines": 0,
+    "sfx_lines": 1,
+    "furigana_suppressed": 0,
+    "orphan_pixels_erased": 0,
+    "sample_crop_saved": null,
+    "duration_ms": {
+      "ctd": 13046.9,
+      "bubble_seg": 320.7,
+      "categorize": 2.4,
+      "vertical_stitch": 27.3,
+      "inpaint": 4.1,
+      "total": 13442.5
+    }
+  }
+}

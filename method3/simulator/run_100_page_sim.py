@@ -101,16 +101,21 @@ def run_simulation(max_pages: Optional[int] = None):
 
         h_img, w_img = img_bgr.shape[:2]
 
-        # 1. Module 1: CTD text boxes + heatmap + Step 1.3 probes
+        # 1. Module 1: CTD text boxes + heatmap
         m1_boxes, ctd_bubbles, prob_map = ctd_engine.run_module1(img_bgr)
 
         # 2. Module 1.2: Manga109 YOLO11-seg bubble masks
         bubble_masks = seg_engine.detect_masks(img_bgr)
 
+        # 2b. Conjoined Lobe Partition before column stitching
+        bubble_masks, distinct_bubbles, m3_partitions = waist_engine.partition_conjoined_bubbles(
+            image_bgr=img_bgr, bubble_masks=bubble_masks, ctd_bubbles=ctd_bubbles
+        )
+
         # 3. Module 1.5: Categorization (BUBBLED, ORPHAN, SFX)
         all_categorized, bubbled_b, orphan_b, sfx_b, distinct_bubbles = TextCategorizer.categorize_boxes(
             raw_boxes=m1_boxes,
-            bubble_regions=ctd_bubbles,
+            bubble_regions=distinct_bubbles,
             bubble_masks=bubble_masks,
             image_bgr=img_bgr,
             bitmap_width=w_img,
@@ -118,7 +123,7 @@ def run_simulation(max_pages: Optional[int] = None):
             is_rtl=True
         )
 
-        # 4. Module 2: Vertical Line Stitching
+        # 4. Module 2: Vertical Line Stitching (with exact mask contour clamping & Catch-Net Reconciler)
         all_lines, b_lines, o_lines, s_lines, furi_suppressed = VerticalLineStitcher.stitch_lines(
             categorized_boxes=all_categorized,
             distinct_bubbles=distinct_bubbles,
@@ -129,12 +134,8 @@ def run_simulation(max_pages: Optional[int] = None):
             is_rtl=True
         )
 
-        # 5. Module 3: Waist Crunch & Line Partitioning
-        m3_partitions = waist_engine.process_page(
-            image_bgr=img_bgr,
-            bubbles=distinct_bubbles,
-            text_lines=all_lines
-        )
+        # 5. Module 3: Lobe Line Assignment
+        waist_engine.assign_partition_lines(m3_partitions, all_lines)
 
         # 6. Automated Defect Auditor
         audit_res = DefectAuditor.audit_page(
@@ -146,7 +147,8 @@ def run_simulation(max_pages: Optional[int] = None):
             m1_5_items=all_categorized,
             m2_lines=all_lines,
             m3_partitions=m3_partitions,
-            image_bgr=img_bgr
+            image_bgr=img_bgr,
+            bubble_masks=bubble_masks
         )
 
         p_elapsed = (time.time() - p_t0) * 1000.0
@@ -164,14 +166,15 @@ def run_simulation(max_pages: Optional[int] = None):
             f"Frag:{audit_res['column_fragmentations']} "
             f"Choke:{audit_res['width_choking_count']} "
             f"Bleed:{audit_res['boundary_bleed_count']} "
+            f"Drop:{audit_res['dropped_box_count']} "
+            f"Empty:{audit_res['empty_bubbles_with_ink']} "
             f"({p_elapsed:.0f}ms)"
         )
         print(status_msg)
 
         # Clean memory per page to avoid heap growth and thermal heat spikes
         del img_bgr, prob_map, bubble_masks, all_categorized, all_lines, m3_partitions
-        if idx % 10 == 0:
-            gc.collect()
+        gc.collect()
 
     total_time = time.time() - total_start
     print("-" * 80)

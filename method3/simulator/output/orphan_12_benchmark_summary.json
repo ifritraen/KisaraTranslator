@@ -1,0 +1,314 @@
+[
+  {
+    "idx": 1,
+    "batch": "batch1",
+    "page": "doctors_knife_004",
+    "crop_size": "121x404",
+    "lines_in_cluster": 1,
+    "bg_std": 3.78,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 13.86,
+      "ms": 4.35
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 1.0
+    },
+    "telea": {
+      "std": 2.62,
+      "ms": 6.29
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 1.43
+    },
+    "comparison_image": "comp_01_batch1_doctors_knife_004.jpg"
+  },
+  {
+    "idx": 2,
+    "batch": "batch1",
+    "page": "doctors_knife_005",
+    "crop_size": "212x584",
+    "lines_in_cluster": 2,
+    "bg_std": 1.46,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 38.16,
+      "ms": 19.72
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 2.3
+    },
+    "telea": {
+      "std": 1.82,
+      "ms": 36.12
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 3.41
+    },
+    "comparison_image": "comp_02_batch1_doctors_knife_005.jpg"
+  },
+  {
+    "idx": 3,
+    "batch": "batch1",
+    "page": "jp_manga_18_009",
+    "crop_size": "136x371",
+    "lines_in_cluster": 1,
+    "bg_std": 21.01,
+    "regime": "Line Art (Telea)",
+    "baseline": {
+      "std": 53.27,
+      "ms": 6.54
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 1.32
+    },
+    "telea": {
+      "std": 19.41,
+      "ms": 17.82
+    },
+    "hybrid": {
+      "std": 19.41,
+      "ms": 17.75
+    },
+    "comparison_image": "comp_03_batch1_jp_manga_18_009.jpg"
+  },
+  {
+    "idx": 4,
+    "batch": "batch2",
+    "page": "c14_p184",
+    "crop_size": "284x250",
+    "lines_in_cluster": 3,
+    "bg_std": 3.97,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 81.22,
+      "ms": 4.01
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 1.42
+    },
+    "telea": {
+      "std": 8.84,
+      "ms": 10.62
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 2.18
+    },
+    "comparison_image": "comp_04_batch2_c14_p184.jpg"
+  },
+  {
+    "idx": 5,
+    "batch": "batch2",
+    "page": "c01_p033",
+    "crop_size": "202x237",
+    "lines_in_cluster": 4,
+    "bg_std": 16.58,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 103.82,
+      "ms": 3.22
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 1.31
+    },
+    "telea": {
+      "std": 12.63,
+      "ms": 11.91
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 1.97
+    },
+    "comparison_image": "comp_05_batch2_c01_p033.jpg"
+  },
+  {
+    "idx": 6,
+    "batch": "batch2",
+    "page": "c05_p002",
+    "crop_size": "192x104",
+    "lines_in_cluster": 5,
+    "bg_std": 30.46,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 72.45,
+      "ms": 3.29
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 0.46
+    },
+    "telea": {
+      "std": 59.13,
+      "ms": 6.44
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 0.77
+    },
+    "comparison_image": "comp_06_batch2_c05_p002.jpg"
+  },
+  {
+    "idx": 7,
+    "batch": "batch3",
+    "page": "c31_p004",
+    "crop_size": "78x136",
+    "lines_in_cluster": 1,
+    "bg_std": 36.77,
+    "regime": "Line Art (Telea)",
+    "baseline": {
+      "std": 84.38,
+      "ms": 0.79
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 0.48
+    },
+    "telea": {
+      "std": 40.72,
+      "ms": 1.14
+    },
+    "hybrid": {
+      "std": 40.72,
+      "ms": 1.37
+    },
+    "comparison_image": "comp_07_batch3_c31_p004.jpg"
+  },
+  {
+    "idx": 8,
+    "batch": "batch3",
+    "page": "c31_p003",
+    "crop_size": "306x399",
+    "lines_in_cluster": 5,
+    "bg_std": 16.87,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 83.73,
+      "ms": 14.82
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 2.9
+    },
+    "telea": {
+      "std": 89.21,
+      "ms": 47.3
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 4.29
+    },
+    "comparison_image": "comp_08_batch3_c31_p003.jpg"
+  },
+  {
+    "idx": 9,
+    "batch": "batch3",
+    "page": "c01_p003",
+    "crop_size": "133x270",
+    "lines_in_cluster": 2,
+    "bg_std": 17.88,
+    "regime": "Line Art (Telea)",
+    "baseline": {
+      "std": 106.03,
+      "ms": 2.21
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 0.71
+    },
+    "telea": {
+      "std": 16.19,
+      "ms": 5.66
+    },
+    "hybrid": {
+      "std": 16.19,
+      "ms": 5.94
+    },
+    "comparison_image": "comp_09_batch3_c01_p003.jpg"
+  },
+  {
+    "idx": 10,
+    "batch": "batch4",
+    "page": "c07_p096",
+    "crop_size": "155x309",
+    "lines_in_cluster": 3,
+    "bg_std": 2.81,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 25.46,
+      "ms": 6.59
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 1.21
+    },
+    "telea": {
+      "std": 10.74,
+      "ms": 13.02
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 1.98
+    },
+    "comparison_image": "comp_10_batch4_c07_p096.jpg"
+  },
+  {
+    "idx": 11,
+    "batch": "batch4",
+    "page": "c08_p008",
+    "crop_size": "151x188",
+    "lines_in_cluster": 3,
+    "bg_std": 6.56,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 48.05,
+      "ms": 2.28
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 0.58
+    },
+    "telea": {
+      "std": 6.35,
+      "ms": 3.58
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 1.0
+    },
+    "comparison_image": "comp_11_batch4_c08_p008.jpg"
+  },
+  {
+    "idx": 12,
+    "batch": "batch4",
+    "page": "c08_p032",
+    "crop_size": "236x390",
+    "lines_in_cluster": 6,
+    "bg_std": 10.69,
+    "regime": "Flat Paper (Median)",
+    "baseline": {
+      "std": 29.09,
+      "ms": 12.68
+    },
+    "median": {
+      "std": 0.0,
+      "ms": 2.26
+    },
+    "telea": {
+      "std": 8.8,
+      "ms": 23.63
+    },
+    "hybrid": {
+      "std": 0.0,
+      "ms": 2.9
+    },
+    "comparison_image": "comp_12_batch4_c08_p032.jpg"
+  }
+]

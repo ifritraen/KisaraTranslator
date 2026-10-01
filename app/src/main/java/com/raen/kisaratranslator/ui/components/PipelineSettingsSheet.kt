@@ -334,12 +334,12 @@ fun PipelineSettingsSheet(
                             FilterChip(
                                 selected = config.sugoiBeamWidth <= 1,
                                 onClick = { service.setConfig(config.copy(sugoiBeamWidth = 1)) },
-                                label = { Text("Fast (Greedy ~1.2s)", fontSize = 11.sp) },
+                                label = { Text("⚡ Fast (Greedy ~1.2s)", fontSize = 11.sp) },
                             )
                             FilterChip(
                                 selected = config.sugoiBeamWidth > 1,
-                                onClick = { service.setConfig(config.copy(sugoiBeamWidth = 3)) },
-                                label = { Text("Quality (Beam 3 ~5s)", fontSize = 11.sp) },
+                                onClick = { service.setConfig(config.copy(sugoiBeamWidth = 2)) },
+                                label = { Text("✨ Quality (Beam 2 ~2.5s)", fontSize = 11.sp) },
                             )
                         }
                     }

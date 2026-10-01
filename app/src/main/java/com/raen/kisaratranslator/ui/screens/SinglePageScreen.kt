@@ -1605,7 +1605,7 @@ private fun DeepStepAnalyticsCard(
                     val bmp = result.originalBitmap
                     MetricRow("Image Resolution", "${bmp.width}x${bmp.height} px")
                     MetricRow("Translator Engine", config.translator.displayName)
-                    MetricRow("Sugoi / SLM Mode", if (config.translator == com.raen.kisaratranslator.data.model.TranslatorType.SUGOI_ONNX) "Beam Width ${config.sugoiBeamWidth}" else "Direct SLM")
+                    MetricRow("Sugoi / SLM Mode", if (config.translator == com.raen.kisaratranslator.data.model.TranslatorType.SUGOI_ONNX) if (config.sugoiBeamWidth <= 1) "⚡ Fast (Greedy)" else "✨ Quality (Beam 2)" else "Direct SLM")
                     MetricRow("Translated Blocks", "${blocks.size} dialogue sentences")
                     MetricRow("Font Scale Multiplier", "${config.textScaleFactor}x")
                     MetricRow("Translation Latency", formatStepTime(diagnostics.translationTimeMs))

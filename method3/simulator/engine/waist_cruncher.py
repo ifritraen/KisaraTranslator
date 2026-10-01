@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from typing import List, Tuple, Optional
-from .types import Rect, TextLineItem, CrunchPartitionItem
+from .types import Rect, TextLineItem, CrunchPartitionItem, BubbleMask
 
 class ConvexityDefectDetector:
     """
@@ -204,6 +204,157 @@ class Method3WaistEngine:
         dist_sq = (real_x - pt_x) ** 2 + (real_y - pt_y) ** 2
         min_idx = int(np.argmin(dist_sq))
         return (int(real_x[min_idx]), int(real_y[min_idx]))
+
+    def partition_conjoined_bubbles(
+        self,
+        image_bgr: np.ndarray,
+        bubble_masks: List[BubbleMask],
+        ctd_bubbles: List[Rect]
+    ) -> Tuple[List[BubbleMask], List[Rect], List[CrunchPartitionItem]]:
+        """
+        Partitions conjoined speech bubbles into distinct lobes before Module 2 column stitching.
+        Separates mask contours at snapped waist notches, preventing column bleed and cross-lobe text merging.
+        """
+        bmp_h, bmp_w = image_bgr.shape[:2]
+
+        valid_masks = [bm for bm in bubble_masks if bm.width >= 18 and bm.height >= 22 and bm.width * bm.height >= 400]
+        valid_ctd = [b for b in ctd_bubbles if b.width() >= 18 and b.height() >= 22 and b.width() * b.height() >= 400]
+        all_rects = [bm.rect for bm in valid_masks] + valid_ctd
+
+        initial_bubbles: List[Rect] = []
+        for b in all_rects:
+            existing = None
+            for other in initial_bubbles:
+                il = max(other.left, b.left)
+                it = max(other.top, b.top)
+                ir = min(other.right, b.right)
+                ib = min(other.bottom, b.bottom)
+                if ir > il and ib > it:
+                    inter_a = (ir - il) * (ib - it)
+                    min_a = min(other.width() * other.height(), b.width() * b.height())
+                    if min_a > 0 and (inter_a / float(min_a)) > 0.45:
+                        existing = other
+                        break
+            if existing is not None:
+                existing.left = min(existing.left, b.left)
+                existing.top = min(existing.top, b.top)
+                existing.right = max(existing.right, b.right)
+                existing.bottom = max(existing.bottom, b.bottom)
+            else:
+                initial_bubbles.append(b.copy())
+
+        partitions: List[CrunchPartitionItem] = []
+        new_bubble_masks: List[BubbleMask] = []
+        new_distinct_bubbles: List[Rect] = []
+
+        for b_idx, b_rect in enumerate(initial_bubbles):
+            pad = 4
+            left = max(0, min(bmp_w - 1, b_rect.left - pad))
+            top = max(0, min(bmp_h - 1, b_rect.top - pad))
+            right = max(left + 1, min(bmp_w, b_rect.right + pad))
+            bottom = max(top + 1, min(bmp_h, b_rect.bottom + pad))
+            crop_w = right - left
+            crop_h = bottom - top
+
+            if crop_w < 12 or crop_h < 12:
+                new_distinct_bubbles.append(b_rect)
+                continue
+
+            crop_bgr = image_bgr[top:bottom, left:right]
+            pred = self.predict_crop(crop_bgr)
+
+            bm = next((m for m in valid_masks if m.rect.contains(b_rect.centerX(), b_rect.centerY()) or
+                       (max(m.rect.left, b_rect.left) < min(m.rect.right, b_rect.right) and
+                        max(m.rect.top, b_rect.top) < min(m.rect.bottom, b_rect.bottom) and
+                        (min(m.rect.right, b_rect.right) - max(m.rect.left, b_rect.left)) *
+                        (min(m.rect.bottom, b_rect.bottom) - max(m.rect.top, b_rect.top)) >= 0.50 * b_rect.width() * b_rect.height())), None)
+
+            if pred is None or not pred["is_conjoined"]:
+                new_distinct_bubbles.append(b_rect)
+                if bm is not None and bm not in new_bubble_masks:
+                    new_bubble_masks.append(bm)
+                partitions.append(CrunchPartitionItem(
+                    bubble_index=b_idx,
+                    bubble_rect=b_rect,
+                    is_conjoined=False,
+                    conf_conj=pred["conf_conj"] if pred else 0.0
+                ))
+                continue
+
+            p1_raw_page = (pred["p1_raw"][0] + left, pred["p1_raw"][1] + top)
+            p2_raw_page = (pred["p2_raw"][0] + left, pred["p2_raw"][1] + top)
+            p1_snapped_page = (pred["p1_snapped"][0] + left, pred["p1_snapped"][1] + top)
+            p2_snapped_page = (pred["p2_snapped"][0] + left, pred["p2_snapped"][1] + top)
+            page_candidates = [(c[0] + left, c[1] + top) for c in pred["candidates"]]
+
+            partition_success = False
+            if bm is not None:
+                p1_m = (p1_snapped_page[0] - bm.rect.left, p1_snapped_page[1] - bm.rect.top)
+                p2_m = (p2_snapped_page[0] - bm.rect.left, p2_snapped_page[1] - bm.rect.top)
+                y_grid, x_grid = np.ogrid[:bm.height, :bm.width]
+                d_map = (x_grid - p1_m[0]) * (p2_m[1] - p1_m[1]) - (y_grid - p1_m[1]) * (p2_m[0] - p1_m[0])
+
+                mask_a = bm.mask & (d_map >= 0)
+                mask_b = bm.mask & (d_map < 0)
+                area_a = int(np.sum(mask_a))
+                area_b = int(np.sum(mask_b))
+
+                if area_a >= 40 and area_b >= 40:
+                    y_a, x_a = np.where(mask_a)
+                    rect_a = Rect(bm.rect.left + int(np.min(x_a)), bm.rect.top + int(np.min(y_a)),
+                                  bm.rect.left + int(np.max(x_a)) + 1, bm.rect.top + int(np.max(y_a)) + 1)
+                    sub_a = mask_a[int(np.min(y_a)):int(np.max(y_a))+1, int(np.min(x_a)):int(np.max(x_a))+1]
+                    bm_a = BubbleMask(rect=rect_a, mask=sub_a, width=rect_a.width(), height=rect_a.height(),
+                                      fill_area=area_a, is_lobe=True, parent_bubble_index=b_idx)
+
+                    y_b, x_b = np.where(mask_b)
+                    rect_b = Rect(bm.rect.left + int(np.min(x_b)), bm.rect.top + int(np.min(y_b)),
+                                  bm.rect.left + int(np.max(x_b)) + 1, bm.rect.top + int(np.max(y_b)) + 1)
+                    sub_b = mask_b[int(np.min(y_b)):int(np.max(y_b))+1, int(np.min(x_b)):int(np.max(x_b))+1]
+                    bm_b = BubbleMask(rect=rect_b, mask=sub_b, width=rect_b.width(), height=rect_b.height(),
+                                      fill_area=area_b, is_lobe=True, parent_bubble_index=b_idx)
+
+                    new_distinct_bubbles.extend([rect_a, rect_b])
+                    new_bubble_masks.extend([bm_a, bm_b])
+                    partition_success = True
+
+            if not partition_success:
+                new_distinct_bubbles.append(b_rect)
+                if bm is not None and bm not in new_bubble_masks:
+                    new_bubble_masks.append(bm)
+
+            part_item = CrunchPartitionItem(
+                bubble_index=b_idx,
+                bubble_rect=b_rect,
+                is_conjoined=True,
+                conf_conj=pred["conf_conj"],
+                p1_raw=p1_raw_page,
+                p2_raw=p2_raw_page,
+                p1_snapped=p1_snapped_page,
+                p2_snapped=p2_snapped_page,
+                candidate_points=page_candidates,
+                lobe_a_line_ids=[],
+                lobe_b_line_ids=[],
+                split_lines=[]
+            )
+            partitions.append(part_item)
+
+        return new_bubble_masks, new_distinct_bubbles, partitions
+
+    def assign_partition_lines(self, partitions: List[CrunchPartitionItem], all_lines: List[TextLineItem]):
+        for part in partitions:
+            if not part.is_conjoined or not part.p1_snapped or not part.p2_snapped:
+                continue
+            b_rect = part.bubble_rect
+            p1 = part.p1_snapped
+            p2 = part.p2_snapped
+            b_lines = [l for l in all_lines if b_rect.contains(l.rect.centerX(), l.rect.centerY())]
+            for l in b_lines:
+                d_val = (l.rect.centerX() - p1[0]) * (p2[1] - p1[1]) - (l.rect.centerY() - p1[1]) * (p2[0] - p1[0])
+                if d_val >= 0:
+                    part.lobe_a_line_ids.append(l.id)
+                else:
+                    part.lobe_b_line_ids.append(l.id)
 
     def process_page(
         self,

@@ -33,58 +33,9 @@ object VerticalLineStitcher {
 
     /**
      * Whiteness & Ink Density Detector.
-     * Screens out phantom text boxes (probes over pure white paper or margin gutters)
-     * by checking stroke luminance and dark pixel contrast.
+     * Zero-Drop Conservation Engine: CTD ink detections are trusted unconditionally.
      */
     fun isBoxBlank(bitmap: Bitmap, rect: Rect): Boolean {
-        val bmp = if (bitmap.config == Bitmap.Config.HARDWARE) {
-            bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return false
-        } else {
-            bitmap
-        }
-        val cL = rect.left.coerceIn(0, bmp.width - 1)
-        val cT = rect.top.coerceIn(0, bmp.height - 1)
-        val cR = rect.right.coerceIn(cL + 1, bmp.width)
-        val cB = rect.bottom.coerceIn(cT + 1, bmp.height)
-        val w = cR - cL
-        val h = cB - cT
-        if (w <= 0 || h <= 0) return true
-        if (w < 4 && h < 4) return true
-
-        val totalPixels = w * h
-        val pixels = IntArray(totalPixels)
-        bmp.getPixels(pixels, 0, w, cL, cT, w, h)
-
-        var minL = 255
-        var maxL = 0
-        var sumL = 0L
-        var darkCount = 0
-        var brightCount = 0
-
-        for (i in 0 until totalPixels) {
-            val p = pixels[i]
-            val r = (p shr 16) and 0xFF
-            val g = (p shr 8) and 0xFF
-            val b = p and 0xFF
-            val y = (r * 77 + g * 150 + b * 29) shr 8
-            if (y < minL) minL = y
-            if (y > maxL) maxL = y
-            sumL += y
-            if (y < 135) darkCount++
-            if (y > 200) brightCount++
-        }
-
-        val contrast = maxL - minL
-        if (contrast < 18) return true
-
-        val meanL = (sumL / totalPixels).toInt()
-        val darkRatio = darkCount.toFloat() / totalPixels.toFloat()
-        val brightRatio = brightCount.toFloat() / totalPixels.toFloat()
-
-        if (meanL > 185 && (darkRatio < 0.008f || darkCount < 4)) return true
-        if (meanL < 70 && (brightRatio < 0.008f || brightCount < 4)) return true
-        if (contrast < 18 && darkRatio < 0.01f) return true
-
         return false
     }
 
@@ -110,41 +61,64 @@ object VerticalLineStitcher {
             bitmap
         }
 
-        // Pre-filter: Discard pure white paper / blank noise boxes before any grouping
-        val validCategorizedBoxes = if (safeBmp != null) {
-            categorizedBoxes.filter { !isBoxBlank(safeBmp, it.rect) }
-        } else {
-            categorizedBoxes
-        }
+        // Zero-Drop Conservation Engine: Preserve 100% of detected CTD boxes
+        val validCategorizedBoxes = categorizedBoxes
         if (validCategorizedBoxes.isEmpty()) {
             return StitchedLinesResult(emptyList(), emptyList(), emptyList(), emptyList(), 0)
         }
 
         // Consolidate bubble regions & masks into distinct bubbles
-        val allBubbleRects = mutableListOf<Rect>()
-        allBubbleRects.addAll(bubbleMasks.map { it.rect })
-        allBubbleRects.addAll(bubbleRegions)
-
         val distinctBubbles = mutableListOf<Rect>()
-        for (b in allBubbleRects) {
-            val existing = distinctBubbles.firstOrNull { other ->
-                val interL = max(other.left, b.left)
-                val interT = max(other.top, b.top)
-                val interR = min(other.right, b.right)
-                val interB = min(other.bottom, b.bottom)
-                if (interR > interL && interB > interT) {
-                    val interArea = (interR - interL).toLong() * (interB - interT).toLong()
-                    val minArea = min(other.width().toLong() * other.height().toLong(), b.width().toLong() * b.height().toLong())
-                    minArea > 0 && interArea.toFloat() / minArea.toFloat() > 0.60f
-                } else false
+        if (bubbleMasks.isNotEmpty()) {
+            for (bm in bubbleMasks) {
+                if (bm.isLobe) {
+                    distinctBubbles.add(Rect(bm.rect))
+                    continue
+                }
+                var dup = false
+                for (existing in distinctBubbles) {
+                    val il = max(existing.left, bm.rect.left)
+                    val it = max(existing.top, bm.rect.top)
+                    val ir = min(existing.right, bm.rect.right)
+                    val ib = min(existing.bottom, bm.rect.bottom)
+                    if (ir > il && ib > it) {
+                        val ia = (ir - il).toLong() * (ib - it).toLong()
+                        val unionA = existing.width().toLong() * existing.height().toLong() +
+                                     bm.rect.width().toLong() * bm.rect.height().toLong() - ia
+                        if (unionA > 0 && ia.toFloat() / unionA.toFloat() > 0.70f) {
+                            dup = true
+                            break
+                        }
+                    }
+                }
+                if (!dup) {
+                    distinctBubbles.add(Rect(bm.rect))
+                }
             }
-            if (existing != null) {
-                existing.left = min(existing.left, b.left)
-                existing.top = min(existing.top, b.top)
-                existing.right = max(existing.right, b.right)
-                existing.bottom = max(existing.bottom, b.bottom)
-            } else {
-                distinctBubbles.add(Rect(b))
+        } else {
+            for (b in bubbleRegions) {
+                // Verify candidate region has physical speech bubble properties (high background whiteness)
+                if (safeBmp != null && !TextCategorizer.isCandidateRealBubble(safeBmp, b)) continue
+
+                val existing = distinctBubbles.firstOrNull { other ->
+                    val interL = max(other.left, b.left)
+                    val interT = max(other.top, b.top)
+                    val interR = min(other.right, b.right)
+                    val interB = min(other.bottom, b.bottom)
+                    if (interR > interL && interB > interT) {
+                        val interArea = (interR - interL).toLong() * (interB - interT).toLong()
+                        val minArea = min(other.width().toLong() * other.height().toLong(), b.width().toLong() * b.height().toLong())
+                        minArea > 0 && interArea.toFloat() / minArea.toFloat() > 0.65f
+                    } else false
+                }
+                if (existing != null) {
+                    existing.left = min(existing.left, b.left)
+                    existing.top = min(existing.top, b.top)
+                    existing.right = max(existing.right, b.right)
+                    existing.bottom = max(existing.bottom, b.bottom)
+                } else {
+                    distinctBubbles.add(Rect(b))
+                }
             }
         }
 
@@ -184,18 +158,36 @@ object VerticalLineStitcher {
                     val isTrulyInBubble = (ratio >= 0.60f && excessX <= max(12, (box.width() * 0.25f).toInt())) || (ratio >= 0.85f)
                     val inEnvelope = cx in (bubble.left - 6)..(bubble.right + 6) && cy in (bubble.top - 6)..(bubble.bottom + 6)
 
-                    val isMatch = if (validCategorizedBoxes[idx].category == TextCategory.BUBBLED) {
-                        bubble.contains(cx, cy) || (inEnvelope && (ratio >= 0.35f || interArea > 0))
+                    val matchingMask = findMatchingMask(bubble, bubbleMasks)
+                    val isMatch = if (matchingMask != null) {
+                        val mil = max(matchingMask.rect.left, box.left)
+                        val mit = max(matchingMask.rect.top, box.top)
+                        val mir = min(matchingMask.rect.right, box.right)
+                        val mib = min(matchingMask.rect.bottom, box.bottom)
+                        var maskPixels = 0
+                        if (mir > mil && mib > mit) {
+                            for (my in mit until mib) {
+                                val rowOff = (my - matchingMask.rect.top) * matchingMask.width
+                                val startX = mil - matchingMask.rect.left
+                                val endX = mir - matchingMask.rect.left
+                                for (mx in startX until endX) {
+                                    if (matchingMask.mask[rowOff + mx]) maskPixels++
+                                }
+                            }
+                        }
+                        val maskRatio = if (boxArea > 0) maskPixels.toFloat() / boxArea.toFloat() else 0f
+                        val lx = cx - matchingMask.rect.left
+                        val ly = cy - matchingMask.rect.top
+                        val inMask = if (lx in 0 until matchingMask.width && ly in 0 until matchingMask.height) {
+                            matchingMask.mask[ly * matchingMask.width + lx]
+                        } else false
+                        inMask && inEnvelope && (maskRatio >= 0.45f || (validCategorizedBoxes[idx].category == TextCategory.BUBBLED && maskRatio >= 0.35f))
                     } else {
-                        val matchingMask = bubbleMasks.firstOrNull { it.rect.contains(cx, cy) }
-                        val inMask = if (matchingMask != null) {
-                            val lx = cx - matchingMask.rect.left
-                            val ly = cy - matchingMask.rect.top
-                            if (lx in 0 until matchingMask.width && ly in 0 until matchingMask.height) {
-                                matchingMask.mask[ly * matchingMask.width + lx]
-                            } else true
-                        } else true
-                        inMask && isTrulyInBubble && inEnvelope
+                        if (validCategorizedBoxes[idx].category == TextCategory.BUBBLED) {
+                            bubble.contains(cx, cy) || (inEnvelope && (ratio >= 0.35f || interArea > 0))
+                        } else {
+                            isTrulyInBubble && inEnvelope
+                        }
                     }
 
                     if (isMatch && interArea > maxInterArea) {
@@ -215,8 +207,10 @@ object VerticalLineStitcher {
             val insideIndices = bubbleAssignments[bIdx]
             if (insideIndices.isEmpty()) continue
 
+            val bTarget = distinctBubbles[bIdx]
+            val matchingMask = findMatchingMask(bTarget, bubbleMasks)
             val rawCluster = insideIndices.map { validCategorizedBoxes[it].rect }
-            val (stitched, furiCount) = stitchBubbleColumns(rawCluster, distinctBubbles[bIdx], medianCharW, safeBmp)
+            val (stitched, furiCount) = stitchBubbleColumns(rawCluster, bTarget, medianCharW, safeBmp, matchingMask)
             resultBubbled.addAll(stitched)
             totalFuriganaSuppressed += furiCount
         }
@@ -246,15 +240,15 @@ object VerticalLineStitcher {
         val containedLines = mutableListOf<TextLineItem>()
         containedLines.addAll(bubbledItems)
 
-        // Suppress unbubbled items with major bubble overlap (>= 50%)
+        // Suppress unbubbled items that significantly overlap an existing bubbled line (>= 50%)
         for (item in orphanItems + sfxItems) {
             val r = Rect(item.rect)
             var valid = true
-            for (b in distinctBubbles) {
-                val interL = max(r.left, b.left)
-                val interT = max(r.top, b.top)
-                val interR = min(r.right, b.right)
-                val interB = min(r.bottom, b.bottom)
+            for (bl in bubbledItems) {
+                val interL = max(r.left, bl.rect.left)
+                val interT = max(r.top, bl.rect.top)
+                val interR = min(r.right, bl.rect.right)
+                val interB = min(r.bottom, bl.rect.bottom)
                 if (interR > interL && interB > interT) {
                     val interArea = (interR - interL).toLong() * (interB - interT).toLong()
                     val rArea = r.width().toLong() * r.height().toLong()
@@ -271,15 +265,174 @@ object VerticalLineStitcher {
 
         // 4b. Deduplicate any near-identical rects (SFX/ORPHAN overlapping identical visual blob)
         val deduplicatedLines = deduplicateLineItems(containedLines)
+        val reconciledLines = deduplicatedLines.toMutableList()
+
+        // 4c. Catch-Net Reconciler: Zero-Drop Conservation Engine
+        // Guarantees that every detected character box is preserved and accounted for in the output lines.
+        fun isBoxCovered(b: Rect, lines: List<TextLineItem>): Boolean {
+            val bcx = b.centerX()
+            val bcy = b.centerY()
+            val bArea = b.width().toLong() * b.height().toLong()
+            for (l in lines) {
+                if (l.rect.contains(bcx, bcy)) return true
+                val il = max(l.rect.left, b.left)
+                val it = max(l.rect.top, b.top)
+                val ir = min(l.rect.right, b.right)
+                val ib = min(l.rect.bottom, b.bottom)
+                if (ir > il && ib > it) {
+                    val interA = (ir - il).toLong() * (ib - it).toLong()
+                    if (bArea > 0 && interA.toFloat() / bArea.toFloat() >= 0.35f) {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+
+        for (item in validCategorizedBoxes) {
+            val b = item.rect
+            if (!isBoxCovered(b, reconciledLines)) {
+                val bcx = b.centerX()
+                val bcy = b.centerY()
+                var bestB: Rect? = null
+                var maxInter = 0L
+                for (bubble in distinctBubbles) {
+                    val il = max(b.left, bubble.left)
+                    val it = max(b.top, bubble.top)
+                    val ir = min(b.right, bubble.right)
+                    val ib = min(b.bottom, bubble.bottom)
+                    if (ir > il && ib > it) {
+                        val interA = (ir - il).toLong() * (ib - it).toLong()
+                        if (interA > maxInter) {
+                            maxInter = interA
+                            bestB = bubble
+                        }
+                    }
+                }
+
+                var isInBubble = false
+                if (bestB != null && (maxInter > 0 || bestB.contains(bcx, bcy))) {
+                    val matchingMask = findMatchingMask(bestB, bubbleMasks)
+                    if (matchingMask != null) {
+                        val mil = max(matchingMask.rect.left, b.left)
+                        val mit = max(matchingMask.rect.top, b.top)
+                        val mir = min(matchingMask.rect.right, b.right)
+                        val mib = min(matchingMask.rect.bottom, b.bottom)
+                        var maskPixels = 0
+                        val bArea = b.width().toLong() * b.height().toLong()
+                        if (mir > mil && mib > mit) {
+                            for (my in mit until mib) {
+                                val rowOff = (my - matchingMask.rect.top) * matchingMask.width
+                                val startX = mil - matchingMask.rect.left
+                                val endX = mir - matchingMask.rect.left
+                                for (mx in startX until endX) {
+                                    if (matchingMask.mask[rowOff + mx]) maskPixels++
+                                }
+                            }
+                        }
+                        val maskRatio = if (bArea > 0) maskPixels.toFloat() / bArea.toFloat() else 0f
+                        val lx = bcx - matchingMask.rect.left
+                        val ly = bcy - matchingMask.rect.top
+                        val inMask = if (lx in 0 until matchingMask.width && ly in 0 until matchingMask.height) {
+                            matchingMask.mask[ly * matchingMask.width + lx]
+                        } else false
+                        isInBubble = inMask && maskRatio >= 0.35f
+                    } else {
+                        isInBubble = true
+                    }
+                }
+
+                if (isInBubble && bestB != null) {
+                    val linesInB = reconciledLines.filter { l ->
+                        l.category == TextCategory.BUBBLED &&
+                        (bestB.contains(l.rect.centerX(), l.rect.centerY()) ||
+                         (max(bestB.left, l.rect.left) < min(bestB.right, l.rect.right) &&
+                          max(bestB.top, l.rect.top) < min(bestB.bottom, l.rect.bottom)))
+                    }
+                    val corridorLine = linesInB.firstOrNull { abs(it.rect.centerX() - bcx) <= medianCharW * 0.75f }
+                    if (corridorLine != null) {
+                        corridorLine.rect.left = min(corridorLine.rect.left, b.left)
+                        corridorLine.rect.right = max(corridorLine.rect.right, b.right)
+                        corridorLine.rect.top = min(corridorLine.rect.top, b.top)
+                        corridorLine.rect.bottom = max(corridorLine.rect.bottom, b.bottom)
+                    } else {
+                        val halfW = (medianCharW * 0.54f).toInt()
+                        val clL = max(bestB.left, min(bcx - halfW, b.left))
+                        val clR = min(bestB.right, max(bcx + halfW, b.right))
+                        val clT = max(bestB.top, b.top)
+                        val clB = min(bestB.bottom, b.bottom)
+                        reconciledLines.add(
+                            TextLineItem(id = 0, rect = Rect(clL, clT, clR, clB), angle = 0f, confidence = 1f, category = TextCategory.BUBBLED, orientation = TextOrientation.VERTICAL)
+                        )
+                    }
+                } else {
+                    val unbubbledLines = reconciledLines.filter { it.category == TextCategory.ORPHAN || it.category == TextCategory.SFX }
+                    var canAbsorb = false
+                    for (ul in unbubbledLines) {
+                        val dx = abs(ul.rect.centerX() - bcx)
+                        val dy = max(0, max(ul.rect.top - b.bottom, b.top - ul.rect.bottom))
+                        if (dx <= medianCharW * 0.8f && dy <= medianCharW * 2.0f) {
+                            ul.rect.left = min(ul.rect.left, b.left)
+                            ul.rect.right = max(ul.rect.right, b.right)
+                            ul.rect.top = min(ul.rect.top, b.top)
+                            ul.rect.bottom = max(ul.rect.bottom, b.bottom)
+                            canAbsorb = true
+                            break
+                        }
+                    }
+                    if (!canAbsorb) {
+                        val cat = if (item.category == TextCategory.SFX) TextCategory.SFX else TextCategory.ORPHAN
+                        reconciledLines.add(
+                            TextLineItem(id = 0, rect = Rect(b), angle = 0f, confidence = 1f, category = cat, orientation = TextOrientation.VERTICAL)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Non-collapsible bubble bound: for every bubble containing CTD ink, ensure at least 1 line exists
+        for (bubble in distinctBubbles) {
+            val boxesInB = validCategorizedBoxes.filter { it ->
+                bubble.contains(it.rect.centerX(), it.rect.centerY()) ||
+                (max(bubble.left, it.rect.left) < min(bubble.right, it.rect.right) &&
+                 max(bubble.top, it.rect.top) < min(bubble.bottom, it.rect.bottom) &&
+                 (min(bubble.right, it.rect.right) - max(bubble.left, it.rect.left)).toLong() *
+                 (min(bubble.bottom, it.rect.bottom) - max(bubble.top, it.rect.top)).toLong() >= 0.45f * it.rect.width().toLong() * it.rect.height().toLong())
+            }
+            if (boxesInB.isNotEmpty()) {
+                val hasLine = reconciledLines.any { l ->
+                    l.category == TextCategory.BUBBLED && (
+                        bubble.contains(l.rect.centerX(), l.rect.centerY()) ||
+                        (max(bubble.left, l.rect.left) < min(bubble.right, l.rect.right) &&
+                         max(bubble.top, l.rect.top) < min(bubble.bottom, l.rect.bottom))
+                    )
+                }
+                if (!hasLine) {
+                    val minL = boxesInB.minOf { it.rect.left }
+                    val maxR = boxesInB.maxOf { it.rect.right }
+                    val minT = boxesInB.minOf { it.rect.top }
+                    val maxB = boxesInB.maxOf { it.rect.bottom }
+                    val halfW = (medianCharW * 0.54f).toInt()
+                    val cx = (minL + maxR) / 2
+                    val clL = max(bubble.left, min(cx - halfW, minL))
+                    val clR = min(bubble.right, max(cx + halfW, maxR))
+                    val clT = max(bubble.top, minT)
+                    val clB = min(bubble.bottom, maxB)
+                    reconciledLines.add(
+                        TextLineItem(id = 0, rect = Rect(clL, clT, clR, clB), angle = 0f, confidence = 1f, category = TextCategory.BUBBLED, orientation = TextOrientation.VERTICAL)
+                    )
+                }
+            }
+        }
 
         // 5. Sort in Japanese reading order (RTL: top-to-bottom bands, right-to-left within bands)
         val sortedAll = if (isRtl) {
-            deduplicatedLines.sortedWith(
+            reconciledLines.sortedWith(
                 compareBy<TextLineItem> { (it.rect.centerY() / 200) }
                     .thenByDescending { it.rect.centerX() }
             )
         } else {
-            deduplicatedLines.sortedWith(
+            reconciledLines.sortedWith(
                 compareBy<TextLineItem> { (it.rect.centerY() / 200) }
                     .thenBy { it.rect.centerX() }
             )
@@ -310,6 +463,7 @@ object VerticalLineStitcher {
         bubble: Rect,
         globalCharW: Float,
         bitmap: Bitmap? = null,
+        matchingMask: BubbleMask? = null,
     ): Pair<List<Rect>, Int> {
         if (boxes.isEmpty()) return Pair(emptyList(), 0)
 
@@ -325,11 +479,8 @@ object VerticalLineStitcher {
         }
         if (clippedBoxes.isEmpty()) return Pair(emptyList(), 0)
 
-        val nonBlank = if (bitmap != null) clippedBoxes.filter { !isBoxBlank(bitmap, it) } else clippedBoxes
-        if (nonBlank.isEmpty()) return Pair(emptyList(), 0)
-
-        // Deduplicate nested boxes
-        val deduplicated = resolveNestedBoxes(nonBlank)
+        // Deduplicate nested boxes (Zero-Drop Engine: ink detections are preserved)
+        val deduplicated = resolveNestedBoxes(clippedBoxes)
 
         // Local character width estimation from standard-sized character boxes
         val standardChars = deduplicated.filter { it.height() >= 16 && it.width() >= 12 }
@@ -529,6 +680,53 @@ object VerticalLineStitcher {
                 clampR += expandR
             }
 
+            // Exact Mask Contour Clamping: Clamp column boundaries to the exact boolean pixel mask
+            if (matchingMask != null) {
+                val rowLefts = mutableListOf<Int>()
+                val rowRights = mutableListOf<Int>()
+                val yMin = max(col.minTop, bubble.top)
+                val yMax = min(col.maxBottom, bubble.bottom)
+                for (y in yMin..yMax) {
+                    val ly = y - matchingMask.rect.top
+                    if (ly in 0 until matchingMask.height) {
+                        var firstX = -1
+                        var lastX = -1
+                        val rowOffset = ly * matchingMask.width
+                        for (x in 0 until matchingMask.width) {
+                            if (matchingMask.mask[rowOffset + x]) {
+                                if (firstX < 0) firstX = x
+                                lastX = x
+                            }
+                        }
+                        if (firstX >= 0) {
+                            rowLefts.add(matchingMask.rect.left + firstX)
+                            rowRights.add(matchingMask.rect.left + lastX + 1)
+                        }
+                    }
+                }
+                if (rowLefts.isNotEmpty() && rowRights.isNotEmpty()) {
+                    val maskL = rowLefts.maxOrNull() ?: clampL
+                    val maskR = rowRights.minOrNull() ?: clampR
+                    if (maskR - maskL >= minColWidthFloor) {
+                        clampL = max(clampL, maskL)
+                        clampR = min(clampR, maskR)
+                    } else {
+                        val sortedL = rowLefts.sorted()
+                        val sortedR = rowRights.sorted()
+                        val pL = sortedL[(sortedL.size * 3) / 4]
+                        val pR = sortedR[sortedR.size / 4]
+                        clampL = max(clampL, pL)
+                        clampR = min(clampR, pR)
+                    }
+                    // Grounding: Never cut through constituent CTD character boxes
+                    clampL = min(clampL, col.minLeft)
+                    clampR = max(clampR, col.maxRight)
+                    // Stay strictly inside bubble envelope
+                    clampL = max(clampL, bubble.left)
+                    clampR = min(clampR, bubble.right)
+                }
+            }
+
             val line = Rect(clampL, clampT, clampR, clampB)
             if (line.width() >= 8 && line.height() >= 12) {
                 groundedCols.add(GroundedColumn(col, line, col.minLeft, col.maxRight))
@@ -655,19 +853,8 @@ object VerticalLineStitcher {
 
             if (isOrphanCandidate) {
                 val orphanRect = Rect(min(cx - halfW, minL), minT, max(cx + halfW, maxR), maxB)
-                val isProperWidth = orphanRect.width() <= medianCharW * 1.45f
-                val isMultiChar = orphanRect.height() >= medianCharW * 1.80f && col.members.size >= 2
-                val isVertical = orphanRect.height() >= orphanRect.width() * 1.30f
-
-                if (isProperWidth && isMultiChar && isVertical) {
-                    if (orphanRect.width() >= 6 && orphanRect.height() >= 6) {
-                        orphans.add(orphanRect)
-                    }
-                } else {
-                    val naturalRect = Rect(minL, minT, maxR, maxB)
-                    if (naturalRect.width() >= 6 && naturalRect.height() >= 6) {
-                        sfx.add(naturalRect)
-                    }
+                if (orphanRect.width() >= 6 && orphanRect.height() >= 6) {
+                    orphans.add(orphanRect)
                 }
             } else {
                 val naturalRect = Rect(minL, minT, maxR, maxB)
@@ -805,12 +992,39 @@ object VerticalLineStitcher {
                         val priI = when (lines[i].category) { TextCategory.BUBBLED -> 3; TextCategory.ORPHAN -> 2; else -> 1 }
                         val priJ = when (lines[j].category) { TextCategory.BUBBLED -> 3; TextCategory.ORPHAN -> 2; else -> 1 }
                         val removeJ = if (priI != priJ) (priI > priJ) else (ra.width().toLong() * ra.height().toLong() >= rb.width().toLong() * rb.height().toLong())
-                        toRemove.add(if (removeJ) j else i)
+                        val survivor = if (removeJ) i else j
+                        val victim = if (removeJ) j else i
+                        lines[survivor].rect.left = min(lines[survivor].rect.left, lines[victim].rect.left)
+                        lines[survivor].rect.right = max(lines[survivor].rect.right, lines[victim].rect.right)
+                        lines[survivor].rect.top = min(lines[survivor].rect.top, lines[victim].rect.top)
+                        lines[survivor].rect.bottom = max(lines[survivor].rect.bottom, lines[victim].rect.bottom)
+                        toRemove.add(victim)
                     }
                 }
             }
         }
         return lines.filterIndexed { index, _ -> index !in toRemove }
+    }
+
+    fun findMatchingMask(bubble: Rect, masks: List<BubbleMask>): BubbleMask? {
+        if (masks.isEmpty()) return null
+        masks.firstOrNull { it.rect == bubble }?.let { return it }
+        var bestMask: BubbleMask? = null
+        var maxInter = 0L
+        for (bm in masks) {
+            val il = max(bm.rect.left, bubble.left)
+            val it = max(bm.rect.top, bubble.top)
+            val ir = min(bm.rect.right, bubble.right)
+            val ib = min(bm.rect.bottom, bubble.bottom)
+            if (ir > il && ib > it) {
+                val inter = (ir - il).toLong() * (ib - it).toLong()
+                if (inter > maxInter) {
+                    maxInter = inter
+                    bestMask = bm
+                }
+            }
+        }
+        return bestMask
     }
 
     /**

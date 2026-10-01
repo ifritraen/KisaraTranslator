@@ -70,7 +70,13 @@ data class CbzPageEntry(
 @Composable
 fun CbzBrowserSheet(
     onDismiss: () -> Unit,
-    onLoadPages: (List<Pair<String, Bitmap>>) -> Unit
+    onLoadPages: (List<Pair<String, Bitmap>>) -> Unit,
+    onTranslateCbz: (
+        pages: List<Pair<String, Bitmap>>,
+        sourceFile: File,
+        metadata: com.raen.crunchlab.data.CrunchExporter.CbzArchiveMetadata,
+        pageIndices: List<Int>
+    ) -> Unit = { _, _, _, _ -> }
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -79,6 +85,7 @@ fun CbzBrowserSheet(
     var selectedArchive by remember { mutableStateOf<CbzMangaItem?>(null) }
     var customArchiveFile by remember { mutableStateOf<File?>(null) }
 
+    var autoStartTranslate by remember { mutableStateOf(true) }
     var isScanningArchives by remember { mutableStateOf(true) }
     var isExtractingPages by remember { mutableStateOf(false) }
     var extractionProgressText by remember { mutableStateOf("") }
@@ -218,6 +225,67 @@ fun CbzBrowserSheet(
         }
     }
 
+    // Extract pages and immediately trigger sequential batch translation pipeline
+    fun executeLoadAndTranslate(targetFile: File, indicesToLoad: List<Int>? = null) {
+        scope.launch {
+            isExtractingPages = true
+            extractionProgress = 0f
+            extractionProgressText = "Opening ${targetFile.name} for translation..."
+
+            val metadata = withContext(Dispatchers.IO) {
+                com.raen.crunchlab.data.CrunchExporter.extractCbzMetadata(targetFile)
+            }
+
+            val decodedPages = withContext(Dispatchers.IO) {
+                val result = mutableListOf<Pair<String, Bitmap>>()
+                try {
+                    val zip = ZipFile(targetFile)
+                    val rawEntries = metadata.imageEntryNames.mapNotNull { zip.getEntry(it) }
+
+                    val targetEntriesWithIndices = if (indicesToLoad != null && indicesToLoad.isNotEmpty()) {
+                        indicesToLoad.mapNotNull { idx -> rawEntries.getOrNull(idx)?.let { idx to it } }
+                    } else {
+                        rawEntries.mapIndexed { idx, entry -> idx to entry }
+                    }
+
+                    val total = targetEntriesWithIndices.size
+                    for ((count, pair) in targetEntriesWithIndices.withIndex()) {
+                        val (origIdx, zEntry) = pair
+                        val bmp = zip.getInputStream(zEntry).use { stream ->
+                            BitmapFactory.decodeStream(stream)
+                        }
+                        if (bmp != null) {
+                            val mangaPrefix = metadata.mangaTitle
+                                ?: targetFile.nameWithoutExtension
+                                    .replace("Chapter", "")
+                                    .replace(".cbz", "")
+                                    .ifBlank { targetFile.parentFile?.name ?: "Manga" }
+                                    .trim('_', ' ')
+                            val pageLabel = "${mangaPrefix}_p${origIdx + 1}"
+                            result.add(pageLabel to bmp)
+                        }
+                        extractionProgress = (count + 1).toFloat() / total
+                    }
+                    zip.close()
+                } catch (e: Exception) {
+                    Log.e("CbzBrowserSheet", "Extraction error: ${e.message}", e)
+                }
+                result
+            }
+
+            isExtractingPages = false
+            if (decodedPages.isNotEmpty()) {
+                val actualIndices = if (indicesToLoad != null && indicesToLoad.isNotEmpty()) {
+                    indicesToLoad
+                } else {
+                    metadata.imageEntryNames.indices.toList()
+                }
+                onTranslateCbz(decodedPages, targetFile, metadata, actualIndices)
+                onDismiss()
+            }
+        }
+    }
+
     // Scan device storage for manga .cbz files
     fun scanDeviceArchives() {
         scope.launch {
@@ -284,10 +352,16 @@ fun CbzBrowserSheet(
             scope.launch {
                 isExtractingPages = true
                 extractionProgressText = "Copying chosen CBZ to cache..."
+                val displayName = try {
+                    context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                } catch (_: Exception) { null } ?: "picked_manga.cbz"
+
                 val cachedFile = withContext(Dispatchers.IO) {
                     try {
                         val input: InputStream? = context.contentResolver.openInputStream(uri)
-                        val temp = File(context.cacheDir, "picked_manga.cbz")
+                        val temp = File(context.cacheDir, displayName)
                         if (temp.exists()) temp.delete()
                         FileOutputStream(temp).use { out ->
                             input?.copyTo(out)
@@ -302,7 +376,11 @@ fun CbzBrowserSheet(
                 if (cachedFile != null && cachedFile.length() > 0) {
                     customArchiveFile = cachedFile
                     selectedArchive = null
-                    inspectCbzFile(cachedFile)
+                    if (autoStartTranslate) {
+                        executeLoadAndTranslate(cachedFile)
+                    } else {
+                        inspectCbzFile(cachedFile)
+                    }
                 } else {
                     isExtractingPages = false
                 }
@@ -367,7 +445,37 @@ fun CbzBrowserSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Auto-translate toggle row
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(
+                        checked = autoStartTranslate,
+                        onCheckedChange = { autoStartTranslate = it }
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        "Auto-translate on selection",
+                        color = if (autoStartTranslate) Color(0xFF00E5FF) else Color.LightGray,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Text(
+                    "Exports to Komikku Local Source",
+                    color = Color.Gray,
+                    fontSize = 9.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
 
             // Archive Selector Carousel
             if (availableArchives.isNotEmpty()) {
@@ -384,20 +492,45 @@ fun CbzBrowserSheet(
                             shape = RoundedCornerShape(6.dp),
                             border = if (isSelected) androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFB388FF)) else null,
                             modifier = Modifier.clickable {
-                                customArchiveFile = null
-                                selectedArchive = item
-                                inspectCbzFile(item.file)
+                                if (autoStartTranslate) {
+                                    executeLoadAndTranslate(item.file)
+                                } else {
+                                    customArchiveFile = null
+                                    selectedArchive = item
+                                    inspectCbzFile(item.file)
+                                }
                             }
                         ) {
                             Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) {
-                                Text(
-                                    item.title,
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        item.title,
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                    Surface(
+                                        color = Color(0xFF00E5FF).copy(alpha = 0.25f),
+                                        shape = RoundedCornerShape(3.dp),
+                                        modifier = Modifier.clickable {
+                                            executeLoadAndTranslate(item.file)
+                                        }
+                                    ) {
+                                        Text(
+                                            "⚡ Translate",
+                                            color = Color(0xFF00E5FF),
+                                            fontSize = 8.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                        )
+                                    }
+                                }
                                 Text(
                                     "${String.format("%.1f", item.sizeMb)}MB · ${item.parentFolder}",
                                     color = if (isSelected) Color(0xFFFFD600) else Color.Gray,
@@ -563,34 +696,56 @@ fun CbzBrowserSheet(
             Spacer(modifier = Modifier.height(8.dp))
 
             // Sticky Execution Action Buttons
+            val targetFile = customArchiveFile ?: selectedArchive?.file
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // 1. Convert Full Manga
+                // 1. Translate Full Manga (Primary Action)
                 Button(
                     onClick = {
-                        executeLoadPages(pageEntries.indices.toList())
+                        if (targetFile != null) {
+                            executeLoadAndTranslate(targetFile, null)
+                        } else {
+                            executeLoadPages(pageEntries.indices.toList())
+                        }
                     },
-                    enabled = pageEntries.isNotEmpty() && !isExtractingPages,
+                    enabled = (pageEntries.isNotEmpty() || targetFile != null) && !isExtractingPages,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6200EA)),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1f).height(44.dp)
+                    modifier = Modifier.weight(1.2f).height(44.dp)
                 ) {
-                    Text("Load Full Manga (${pageEntries.size}p)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text("🚀 Translate Full CBZ (${pageEntries.size}p)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
 
-                // 2. Convert Selected Pages
-                Button(
-                    onClick = {
-                        executeLoadPages(selectedPageIndices.sorted())
-                    },
-                    enabled = selectedPageIndices.isNotEmpty() && !isExtractingPages,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF6D00)),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1f).height(44.dp)
-                ) {
-                    Text("Load Selected (${selectedPageIndices.size}p)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                // 2. Translate Selected Pages or Inspect in Studio
+                if (selectedPageIndices.isNotEmpty() && selectedPageIndices.size < pageEntries.size) {
+                    Button(
+                        onClick = {
+                            if (targetFile != null) {
+                                executeLoadAndTranslate(targetFile, selectedPageIndices.sorted())
+                            } else {
+                                executeLoadPages(selectedPageIndices.sorted())
+                            }
+                        },
+                        enabled = !isExtractingPages,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF6D00)),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.weight(1f).height(44.dp)
+                    ) {
+                        Text("⚡ Translate (${selectedPageIndices.size}p)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = {
+                            executeLoadPages(pageEntries.indices.toList())
+                        },
+                        enabled = pageEntries.isNotEmpty() && !isExtractingPages,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.weight(0.9f).height(44.dp)
+                    ) {
+                        Text("Inspect Studio", fontSize = 10.sp, color = Color.LightGray)
+                    }
                 }
             }
         }

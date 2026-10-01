@@ -361,5 +361,7 @@ class ComicTextDetector:
         pass1_boxes = self.recombine_split_character_boxes(
             self.deduplicate_boxes(raw_pass1 + heatmap_islands), bubbles
         )
+        for idx, box in enumerate(pass1_boxes):
+            box.id = idx + 1
 
         return pass1_boxes, bubbles, seg

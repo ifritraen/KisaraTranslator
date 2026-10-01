@@ -88,9 +88,14 @@ def run_verification(seed: int = 1337, per_batch: int = 4):
         # 2. Module 1.2
         bubble_masks = seg_engine.detect_masks(img_bgr)
 
+        # 2b. Conjoined Lobe Partition before column stitching
+        bubble_masks, distinct_bubbles, m3_parts = waist_engine.partition_conjoined_bubbles(
+            image_bgr=img_bgr, bubble_masks=bubble_masks, ctd_bubbles=ctd_bubbles
+        )
+
         # 3. Module 1.5
         all_categorized, b_boxes, o_boxes, s_boxes, distinct_bubbles = TextCategorizer.categorize_boxes(
-            raw_boxes=m1_boxes, bubble_regions=ctd_bubbles, bubble_masks=bubble_masks,
+            raw_boxes=m1_boxes, bubble_regions=distinct_bubbles, bubble_masks=bubble_masks,
             image_bgr=img_bgr, bitmap_width=w_img, bitmap_height=h_img, is_rtl=True
         )
 
@@ -100,15 +105,20 @@ def run_verification(seed: int = 1337, per_batch: int = 4):
             image_bgr=img_bgr, bitmap_width=w_img, bitmap_height=h_img, is_rtl=True
         )
 
-        # 5. Module 3
-        m3_parts = waist_engine.process_page(image_bgr=img_bgr, bubbles=distinct_bubbles, text_lines=all_lines)
+        # 5. Module 3: Line assignment to lobes
+        waist_engine.assign_partition_lines(m3_parts, all_lines)
 
         # 6. Audit
         audit = DefectAuditor.audit_page(
             page_id=page_id, batch_name=batch, image_shape=(h_img, w_img),
             m1_boxes=m1_boxes, distinct_bubbles=distinct_bubbles, m1_5_items=all_categorized,
-            m2_lines=all_lines, m3_partitions=m3_parts, image_bgr=img_bgr
+            m2_lines=all_lines, m3_partitions=m3_parts, image_bgr=img_bgr, bubble_masks=bubble_masks
         )
+
+        # Strict Invariant Assertions
+        assert audit['dropped_box_count'] == 0, f"Invariant violation: {audit['dropped_box_count']} dropped boxes in {page_id}"
+        assert audit['empty_bubbles_with_ink'] == 0, f"Invariant violation: {audit['empty_bubbles_with_ink']} empty bubbles in {page_id}"
+        assert audit['mask_boundary_bleed_count'] == 0, f"Invariant violation: {audit['mask_boundary_bleed_count']} mask boundary bleeds in {page_id}"
 
         elapsed = (time.time() - p_t0) * 1000.0
         audit["elapsed_ms"] = round(elapsed, 1)
@@ -128,7 +138,7 @@ def run_verification(seed: int = 1337, per_batch: int = 4):
             f"(Pitch:{audit['column_pitch_violations']} Frag:{audit['column_fragmentations']} "
             f"Choke:{audit['width_choking_count']} Bleed:{audit['boundary_bleed_count']} "
             f"Cross:{audit['gutter_crossover_count']} Snap:{audit['waist_snap_failures']} "
-            f"Drop:{audit['dropped_box_count']}) | {elapsed:.0f}ms"
+            f"Drop:{audit['dropped_box_count']} Empty:{audit['empty_bubbles_with_ink']}) | {elapsed:.0f}ms"
         )
         print(status_msg)
 

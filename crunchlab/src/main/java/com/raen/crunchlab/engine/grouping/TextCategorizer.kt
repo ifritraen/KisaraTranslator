@@ -33,6 +33,7 @@ object TextCategorizer {
         rawBoxes: List<Rect>,
         bubbleRegions: List<Rect>,
         bubbleMasks: List<BubbleMask> = emptyList(),
+        ctdBubbles: List<Rect> = emptyList(),
         bitmap: Bitmap? = null,
         bitmapWidth: Int,
         bitmapHeight: Int,
@@ -50,30 +51,57 @@ object TextCategorizer {
         // 1. Combine valid bubble regions (Manga109 masks + CTD bubble envelopes)
         val validBubbleRegions = bubbleRegions.filter { it.width() >= 18 && it.height() >= 22 && it.width() * it.height() >= 400 }
         val validMasks = bubbleMasks.filter { it.width >= 18 && it.height >= 22 && it.width * it.height >= 400 }
-        val allBubbleRects = mutableListOf<Rect>()
-        allBubbleRects.addAll(validMasks.map { it.rect })
-        allBubbleRects.addAll(validBubbleRegions)
-
         val distinctBubbles = mutableListOf<Rect>()
-        for (b in allBubbleRects) {
-            val existing = distinctBubbles.firstOrNull { other ->
-                val interL = max(other.left, b.left)
-                val interT = max(other.top, b.top)
-                val interR = min(other.right, b.right)
-                val interB = min(other.bottom, b.bottom)
-                if (interR > interL && interB > interT) {
-                    val interArea = (interR - interL).toLong() * (interB - interT).toLong()
-                    val minArea = min(other.width().toLong() * other.height().toLong(), b.width().toLong() * b.height().toLong())
-                    minArea > 0 && interArea.toFloat() / minArea.toFloat() > 0.60f
-                } else false
+        if (validMasks.isNotEmpty()) {
+            for (bm in validMasks) {
+                if (bm.isLobe) {
+                    distinctBubbles.add(Rect(bm.rect))
+                    continue
+                }
+                var dup = false
+                for (existing in distinctBubbles) {
+                    val il = max(existing.left, bm.rect.left)
+                    val it = max(existing.top, bm.rect.top)
+                    val ir = min(existing.right, bm.rect.right)
+                    val ib = min(existing.bottom, bm.rect.bottom)
+                    if (ir > il && ib > it) {
+                        val ia = (ir - il).toLong() * (ib - it).toLong()
+                        val unionA = existing.width().toLong() * existing.height().toLong() +
+                                     bm.rect.width().toLong() * bm.rect.height().toLong() - ia
+                        if (unionA > 0 && ia.toFloat() / unionA.toFloat() > 0.70f) {
+                            dup = true
+                            break
+                        }
+                    }
+                }
+                if (!dup) {
+                    distinctBubbles.add(Rect(bm.rect))
+                }
             }
-            if (existing != null) {
-                existing.left = min(existing.left, b.left)
-                existing.top = min(existing.top, b.top)
-                existing.right = max(existing.right, b.right)
-                existing.bottom = max(existing.bottom, b.bottom)
-            } else {
-                distinctBubbles.add(Rect(b))
+        } else {
+            for (b in validBubbleRegions) {
+                // Verify candidate region has physical speech bubble properties (high background whiteness)
+                if (bitmap != null && !isCandidateRealBubble(bitmap, b)) continue
+
+                val existing = distinctBubbles.firstOrNull { other ->
+                    val interL = max(other.left, b.left)
+                    val interT = max(other.top, b.top)
+                    val interR = min(other.right, b.right)
+                    val interB = min(other.bottom, b.bottom)
+                    if (interR > interL && interB > interT) {
+                        val interArea = (interR - interL).toLong() * (interB - interT).toLong()
+                        val minArea = min(other.width().toLong() * other.height().toLong(), b.width().toLong() * b.height().toLong())
+                        minArea > 0 && interArea.toFloat() / minArea.toFloat() > 0.65f
+                    } else false
+                }
+                if (existing != null) {
+                    existing.left = min(existing.left, b.left)
+                    existing.top = min(existing.top, b.top)
+                    existing.right = max(existing.right, b.right)
+                    existing.bottom = max(existing.bottom, b.bottom)
+                } else {
+                    distinctBubbles.add(Rect(b))
+                }
             }
         }
 
@@ -104,14 +132,30 @@ object TextCategorizer {
                     val isInBubbleEnvelope = (bubble.contains(cx, cy) && (ratio >= 0.45f || isTrulyInBubble)) ||
                         (inEnvelope && ratio >= 0.70f)
 
-                    val matchingMask = validMasks.firstOrNull { it.rect.contains(cx, cy) }
+                    val matchingMask = findMatchingMask(bubble, validMasks)
                     val isMatch = if (matchingMask != null) {
+                        val mil = max(matchingMask.rect.left, box.left)
+                        val mit = max(matchingMask.rect.top, box.top)
+                        val mir = min(matchingMask.rect.right, box.right)
+                        val mib = min(matchingMask.rect.bottom, box.bottom)
+                        var maskPixels = 0
+                        if (mir > mil && mib > mit) {
+                            for (my in mit until mib) {
+                                val rowOff = (my - matchingMask.rect.top) * matchingMask.width
+                                val startX = mil - matchingMask.rect.left
+                                val endX = mir - matchingMask.rect.left
+                                for (mx in startX until endX) {
+                                    if (matchingMask.mask[rowOff + mx]) maskPixels++
+                                }
+                            }
+                        }
+                        val maskRatio = if (boxArea > 0) maskPixels.toFloat() / boxArea.toFloat() else 0f
                         val lx = cx - matchingMask.rect.left
                         val ly = cy - matchingMask.rect.top
                         val inMask = if (lx in 0 until matchingMask.width && ly in 0 until matchingMask.height) {
                             matchingMask.mask[ly * matchingMask.width + lx]
                         } else false
-                        (inMask && isTrulyInBubble && inEnvelope) || isInBubbleEnvelope
+                        inMask && inEnvelope && maskRatio >= 0.45f
                     } else {
                         isInBubbleEnvelope
                     }
@@ -148,19 +192,41 @@ object TextCategorizer {
         val orphanIndices = rawBoxes.indices.filter { !assigned[it] }
         val rawNonBubbledBoxes = orphanIndices.map { rawBoxes[it] }
 
-        // Cluster adjacent non-bubbled boxes into local proximity groups for geometric analysis
+        // Cluster adjacent non-bubbled boxes into local typography proximity groups
         val nonBubbledClusters = clusterAdjacentBoxes(rawNonBubbledBoxes, bitmapWidth, bitmapHeight)
 
+        val validCtd = ctdBubbles.filter { it.width() >= 14 && it.height() >= 14 }
+
         for (cluster in nonBubbledClusters) {
-            // Cluster-level coherent classification:
-            // Prevents adjacent strokes/radicals of the same glyph/word from being split into conflicting categories
-            val sfxVotes = if (bitmap != null) {
-                cluster.count { classifyOrphanVsSfx(bitmap, it, cluster) == TextCategory.SFX }
-            } else 0
-            val clusterCategory = if (bitmap != null && sfxVotes.toFloat() / cluster.size.toFloat() >= 0.35f) {
-                TextCategory.SFX
+            val clusterCategory = if (validCtd.isNotEmpty()) {
+                // User Law: Declare ORPHAN to those detected by CTD as bubble/block, but failed Manga109 test.
+                // Others are simply SFX.
+                val matchesCtd = cluster.any { box ->
+                    val cx = box.centerX()
+                    val cy = box.centerY()
+                    val bArea = box.width().toLong() * box.height().toLong()
+                    validCtd.any { ctd ->
+                        val il = max(box.left, ctd.left)
+                        val it = max(box.top, ctd.top)
+                        val ir = min(box.right, ctd.right)
+                        val ib = min(box.bottom, ctd.bottom)
+                        val interArea = if (ir > il && ib > it) (ir - il).toLong() * (ib - it).toLong() else 0L
+                        val ratio = if (bArea > 0) interArea.toFloat() / bArea.toFloat() else 0f
+                        val inEnv = cx in (ctd.left - 6)..(ctd.right + 6) && cy in (ctd.top - 6)..(ctd.bottom + 6)
+                        (ctd.contains(cx, cy) && ratio >= 0.35f) || (inEnv && ratio >= 0.40f) || ratio >= 0.55f
+                    }
+                }
+                if (matchesCtd) TextCategory.ORPHAN else TextCategory.SFX
             } else {
-                TextCategory.ORPHAN
+                // Fallback: Stroke caliber and aspect regularity scoring when CTD bubbles unavailable
+                val sfxVotes = if (bitmap != null) {
+                    cluster.count { classifyOrphanVsSfx(bitmap, it, cluster) == TextCategory.SFX }
+                } else 0
+                if (bitmap != null && sfxVotes.toFloat() / cluster.size.toFloat() >= 0.65f) {
+                    TextCategory.SFX
+                } else {
+                    TextCategory.ORPHAN
+                }
             }
 
             for (box in cluster) {
@@ -272,32 +338,68 @@ object TextCategorizer {
         val strokeCaliber = (2f * darkPixels) / max(1, edgePixels)
 
         val strokeScore = when {
-            strokeCaliber in 1.2f..4.0f && fillRatio in 0.08f..0.42f -> 1.0f
-            strokeCaliber in 1.0f..5.0f && fillRatio in 0.06f..0.50f -> 0.65f
-            strokeCaliber > 6.2f || fillRatio > 0.55f || fillRatio < 0.04f -> 0.1f
-            else -> 0.4f
+            strokeCaliber in 1.0f..4.8f && fillRatio in 0.05f..0.75f -> 1.0f
+            strokeCaliber in 0.8f..5.8f && fillRatio in 0.04f..0.85f -> 0.70f
+            strokeCaliber > 8.0f || fillRatio < 0.02f -> 0.1f
+            else -> 0.45f
         }
 
         // 2. Geometric Regularity
-        var aspectRegularityScore = 0.5f
+        // For Japanese text, single glyphs have aspect ~ 1.0, and vertical line strips have aspect <= 0.55
+        var aspectRegularityScore = 0.6f
         if (cluster.isNotEmpty()) {
             val ratios = cluster.map { it.width().toFloat() / max(1, it.height()).toFloat() }
             val avgRatio = ratios.average()
-            aspectRegularityScore = if (avgRatio in 0.65..1.40) 1.0f else 0.3f
+            aspectRegularityScore = when {
+                avgRatio in 0.10..0.55 -> 1.0f // Vertical column / text line
+                avgRatio in 0.65..1.40 -> 1.0f // Standard character aspect
+                else -> 0.45f
+            }
         }
 
         // 3. Combined Supreme Regularity Score
         val supremeScore = 0.55f * strokeScore + 0.45f * aspectRegularityScore
-        return if (supremeScore >= 0.52f) TextCategory.ORPHAN else TextCategory.SFX
+        return if (supremeScore >= 0.50f) TextCategory.ORPHAN else TextCategory.SFX
     }
 
     /**
-     * Proximity clustering for adjacent non-bubbled character boxes.
+     * Verifies whether an unsegmented candidate box has genuine speech bubble physical properties
+     * (predominantly bright/white interior background >= 60%).
+     */
+    fun isCandidateRealBubble(bitmap: Bitmap, rect: Rect): Boolean {
+        val cL = rect.left.coerceIn(0, bitmap.width)
+        val cT = rect.top.coerceIn(0, bitmap.height)
+        val cR = rect.right.coerceIn(0, bitmap.width)
+        val cB = rect.bottom.coerceIn(0, bitmap.height)
+        val w = cR - cL
+        val h = cB - cT
+        if (w < 18 || h < 22) return false
+        val total = w * h
+        val pixels = IntArray(total)
+        bitmap.getPixels(pixels, 0, w, cL, cT, w, h)
+        var whiteCount = 0
+        for (p in pixels) {
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val lum = (r * 77 + g * 150 + b * 29) shr 8
+            if (lum >= 195) whiteCount++
+        }
+        val whiteRatio = whiteCount.toFloat() / total.toFloat()
+        return whiteRatio >= 0.60f
+    }
+
+    /**
+     * Typography-aware proximity clustering for adjacent non-bubbled character boxes.
+     * Clusters boxes into localized columnar dialogue groups without cross-panel domino chaining.
      */
     private fun clusterAdjacentBoxes(boxes: List<Rect>, bitmapWidth: Int, bitmapHeight: Int): List<List<Rect>> {
         if (boxes.isEmpty()) return emptyList()
         val visited = BooleanArray(boxes.size)
         val clusters = mutableListOf<List<Rect>>()
+
+        val charWidths = boxes.map { min(it.width(), it.height()) }.sorted()
+        val medianW = charWidths[charWidths.size / 2].toFloat().coerceIn(16f, 50f)
 
         for (i in boxes.indices) {
             if (visited[i]) continue
@@ -309,15 +411,23 @@ object TextCategorizer {
             while (queue.isNotEmpty()) {
                 val currIdx = queue.removeFirst()
                 val b1 = boxes[currIdx]
-                val span = max(b1.width(), b1.height()) * 1.5f
 
                 for (j in boxes.indices) {
                     if (visited[j]) continue
                     val b2 = boxes[j]
                     val dx = max(0, max(b1.left, b2.left) - min(b1.right, b2.right))
                     val dy = max(0, max(b1.top, b2.top) - min(b1.bottom, b2.bottom))
+                    val cxDist = abs(b1.centerX() - b2.centerX())
+                    val vOverlap = max(0, min(b1.bottom, b2.bottom) - max(b1.top, b2.top))
+                    val minH = min(b1.height(), b2.height())
 
-                    if (dx <= span && dy <= span) {
+                    // Japanese typography proximity:
+                    // 1. Column alignment (vertical text line corridor)
+                    val isCol = (cxDist <= 1.25f * medianW) && (dy <= 2.8f * medianW)
+                    // 2. Parallel columns side-by-side
+                    val isParallel = (dx <= 2.2f * medianW) && (vOverlap >= 0.15f * minH || dy <= 1.0f * medianW)
+
+                    if (isCol || isParallel) {
                         visited[j] = true
                         currentCluster.add(b2)
                         queue.add(j)
@@ -327,5 +437,26 @@ object TextCategorizer {
             clusters.add(currentCluster)
         }
         return clusters
+    }
+
+    fun findMatchingMask(bubble: Rect, masks: List<BubbleMask>): BubbleMask? {
+        if (masks.isEmpty()) return null
+        masks.firstOrNull { it.rect == bubble }?.let { return it }
+        var bestMask: BubbleMask? = null
+        var maxInter = 0L
+        for (bm in masks) {
+            val il = max(bm.rect.left, bubble.left)
+            val it = max(bm.rect.top, bubble.top)
+            val ir = min(bm.rect.right, bubble.right)
+            val ib = min(bm.rect.bottom, bubble.bottom)
+            if (ir > il && ib > it) {
+                val inter = (ir - il).toLong() * (ib - it).toLong()
+                if (inter > maxInter) {
+                    maxInter = inter
+                    bestMask = bm
+                }
+            }
+        }
+        return bestMask
     }
 }

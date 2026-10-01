@@ -71,6 +71,21 @@ class ComicTextDetector(
             return session != null
         }
 
+    var configuredThreads: Int = 4
+    var hardwareDelegate: com.raen.crunchlab.engine.profile.HardwareDelegate = com.raen.crunchlab.engine.profile.HardwareDelegate.XNNPACK
+
+    fun setResourceConfig(threads: Int, delegate: com.raen.crunchlab.engine.profile.HardwareDelegate = hardwareDelegate) {
+        val numCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val safeThreads = threads.coerceIn(1, numCores)
+        if (safeThreads != configuredThreads || delegate != hardwareDelegate) {
+            configuredThreads = safeThreads
+            hardwareDelegate = delegate
+            session?.close()
+            session = null
+            loadedPath = null
+        }
+    }
+
     fun setSpeedLevel(level: Int) {
         val numCores = Runtime.getRuntime().availableProcessors()
         val targetThreads = when (level.coerceIn(1, 4)) {
@@ -79,12 +94,7 @@ class ComicTextDetector(
             3 -> 3.coerceAtMost(numCores)
             else -> 4.coerceAtMost(numCores)
         }
-        if (targetThreads != configuredThreads) {
-            configuredThreads = targetThreads
-            session?.close()
-            session = null
-            loadedPath = null
-        }
+        setResourceConfig(targetThreads, hardwareDelegate)
     }
 
     fun ensureSession(): Boolean {
@@ -103,12 +113,12 @@ class ComicTextDetector(
 
         val numCores = Runtime.getRuntime().availableProcessors()
         val threads = configuredThreads.coerceIn(1, numCores)
-        val opts = AiBufferUtils.createSessionOptions(threads)
+        val opts = AiBufferUtils.createSessionOptions(threads, hardwareDelegate)
 
         return try {
             session = env.createSession(modelFile.absolutePath, opts)
             loadedPath = modelFile.absolutePath
-            Log.i("CrunchLab", "Loaded ComicTextDetector (XNNPACK $threads-threads): ${modelFile.name} (${modelFile.length() / 1024}KB)")
+            Log.i("CrunchLab", "Loaded ComicTextDetector ($threads-threads, ${hardwareDelegate.shortLabel}): ${modelFile.name} (${modelFile.length() / 1024}KB)")
             true
         } catch (e: Exception) {
             Log.e("CrunchLab", "CTD Model load failed: ${e.message}")

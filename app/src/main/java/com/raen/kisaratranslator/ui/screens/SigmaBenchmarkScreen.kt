@@ -213,7 +213,7 @@ fun SigmaBenchmarkScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Engine: ${config.translator.displayName} (Beam: ${config.sugoiBeamWidth})",
+                            text = "Engine: ${config.translator.displayName} (Mode: ${if (config.sugoiBeamWidth <= 1) "⚡ Fast" else "✨ Quality"})",
                             fontSize = 11.sp,
                             color = Color(0xFF81D4FA),
                             fontFamily = FontFamily.Monospace,
