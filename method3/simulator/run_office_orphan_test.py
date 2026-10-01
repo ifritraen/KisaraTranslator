@@ -49,6 +49,20 @@ TARGET_PAGES = [
     }
 ]
 
+def cv2_imread_unicode(filepath: str) -> np.ndarray:
+    with open(filepath, "rb") as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+def cv2_imwrite_unicode(filepath: str, img: np.ndarray, params=None) -> bool:
+    ext = Path(filepath).suffix
+    success, encoded = cv2.imencode(ext, img, params)
+    if success:
+        with open(filepath, "wb") as f:
+            f.write(encoded)
+        return True
+    return False
+
 def add_header(img: np.ndarray, title: str, subtitle: str, color=(35, 35, 35)) -> np.ndarray:
     h, w = 46, img.shape[1]
     banner = np.full((h, w, 3), color, dtype=np.uint8)
@@ -80,7 +94,7 @@ for pinfo in TARGET_PAGES:
     print(f"Processing {title} -> {Path(ppath).name}", flush=True)
     print(f"==========================================", flush=True)
 
-    img = cv2.imread(ppath)
+    img = cv2_imread_unicode(ppath)
     if img is None:
         print(f"Error: Failed to read image: {ppath}", flush=True)
         continue
